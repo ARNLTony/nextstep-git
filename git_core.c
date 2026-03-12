@@ -545,8 +545,16 @@ int response_size;
             continue;
 
         if (!sent) {
-            tls_write(context, (unsigned char *)http_request, req_len);
-            https_send_pending(sockfd, context);
+            /* Send in chunks to respect TLS record size limits */
+            int offset = 0;
+            int chunk;
+            while (offset < req_len) {
+                chunk = req_len - offset;
+                if (chunk > 8192) chunk = 8192;
+                tls_write(context, (unsigned char *)http_request + offset, chunk);
+                https_send_pending(sockfd, context);
+                offset += chunk;
+            }
             sent = 1;
         }
 
@@ -1166,6 +1174,104 @@ int dirout_size;
     }
 }
 
+/*
+ * Download a file from GitHub. Tries the Contents API first (works for
+ * files under ~100KB). If the response isn't base64-encoded (large file),
+ * falls back to the Git Blobs API using the blob SHA from the tree.
+ *
+ * Returns decoded file data (caller must free) and sets *out_len.
+ * Returns NULL on failure.
+ */
+static char *gh_download_file(token, owner, repo, path, branch, blob_sha, out_len)
+char *token;
+char *owner;
+char *repo;
+char *path;
+char *branch;
+char *blob_sha;
+int *out_len;
+{
+    char api_path[1024];
+    char *response;
+    char *val;
+    int len;
+    int http_status;
+    int content_len;
+    char *decoded;
+    int decoded_len;
+    int resp_size;
+
+    *out_len = 0;
+
+    /* Try Contents API first (small files) */
+    response = (char *)malloc(GIT_RESPONSE_BUF);
+    if (!response) return NULL;
+
+    sprintf(api_path, "/repos/%s/%s/contents/%s?ref=%s",
+            owner, repo, path, branch);
+    http_status = gh_api_request(token, "GET", api_path, NULL,
+                                 response, GIT_RESPONSE_BUF);
+
+    if (http_status >= 200 && http_status < 300) {
+        val = json_find_string(response, "encoding", &len);
+        if (val && len >= 6 && strncmp(val, "base64", 6) == 0) {
+            /* Got base64 content from Contents API */
+            val = json_find_string(response, "content", &content_len);
+            if (val && content_len > 0) {
+                decoded = (char *)malloc(content_len + 1);
+                if (decoded) {
+                    decoded_len = gh_base64_decode(val, content_len,
+                                                   decoded, content_len + 1);
+                    free(response);
+                    *out_len = decoded_len;
+                    return decoded;
+                }
+            }
+            free(response);
+            return NULL;
+        }
+    }
+    free(response);
+
+    /* Contents API didn't return base64 — try Blobs API */
+    if (!blob_sha || !blob_sha[0]) return NULL;
+
+    /* Blobs API returns base64; allocate larger buffer.
+     * GitHub blob limit is 100MB; we support up to ~1.3MB files here
+     * (conservative for 32MB NeXTstation).
+     */
+    resp_size = 1024 * 1024 * 2;  /* 2MB */
+    response = (char *)malloc(resp_size);
+    if (!response) return NULL;
+
+    sprintf(api_path, "/repos/%s/%s/git/blobs/%s",
+            owner, repo, blob_sha);
+    http_status = gh_api_request(token, "GET", api_path, NULL,
+                                 response, resp_size);
+
+    if (http_status < 200 || http_status >= 300) {
+        free(response);
+        return NULL;
+    }
+
+    val = json_find_string(response, "content", &content_len);
+    if (!val || content_len == 0) {
+        free(response);
+        return NULL;
+    }
+
+    decoded = (char *)malloc(content_len + 1);
+    if (!decoded) {
+        free(response);
+        return NULL;
+    }
+
+    decoded_len = gh_base64_decode(val, content_len, decoded, content_len + 1);
+    free(response);
+    *out_len = decoded_len;
+    return decoded;
+}
+
 /* --- git_clone --- */
 
 GitResult git_clone(r, progress_fn, userdata)
@@ -1374,7 +1480,6 @@ void *userdata;
         char progress_msg[GIT_MAX_ERRMSG];
         char *decoded;
         int decoded_len;
-        int content_len;
 
         sprintf(progress_msg, "Downloading %s (%d/%d)",
                 file_paths[i], i + 1, file_count);
@@ -1387,32 +1492,11 @@ void *userdata;
             return result;
         }
 
-        /* GET /repos/{owner}/{repo}/contents/{path}?ref={branch} */
-        sprintf(api_path, "/repos/%s/%s/contents/%s?ref=%s",
-                r->owner, r->repo, file_paths[i], r->branch);
-        http_status = gh_api_request(r->token, "GET", api_path, NULL,
-                                     response, GIT_RESPONSE_BUF);
-
-        if (http_status < 200 || http_status >= 300) {
-            /* skip files that fail to download */
-            continue;
-        }
-
-        /* Check encoding is base64 */
-        val = json_find_string(response, "encoding", &len);
-        if (!val || len < 6 || strncmp(val, "base64", 6) != 0) {
-            /* file too large for contents API, skip */
-            continue;
-        }
-
-        /* Get content */
-        val = json_find_string(response, "content", &content_len);
-        if (!val || content_len == 0) continue;
-
-        decoded = (char *)malloc(content_len + 1);
+        /* Download file via Contents API or Blobs API fallback */
+        decoded = gh_download_file(r->token, r->owner, r->repo,
+                                    file_paths[i], r->branch,
+                                    file_shas[i], &decoded_len);
         if (!decoded) continue;
-
-        decoded_len = gh_base64_decode(val, content_len, decoded, content_len + 1);
 
         /* Create parent directories */
         sprintf(filepath, "%s/%s", r->local_path, file_paths[i]);
@@ -1998,10 +2082,10 @@ void *userdata;
         free(post_body);
 
         if (http_status < 200 || http_status >= 300) {
-            free(response); free(staged_paths); free(blob_shas);
             result.code = GIT_ERR_NETWORK;
-            sprintf(result.message, "Failed to create blob for %s (HTTP %d)",
-                    staged_paths[i], http_status);
+            sprintf(result.message, "Blob fail %s (HTTP %d): %.200s",
+                    staged_paths[i], http_status, response);
+            free(response); free(staged_paths); free(blob_shas);
             return result;
         }
 
@@ -2391,14 +2475,11 @@ void *userdata;
 
             /* Need to download this file (new or changed) */
             {
-                char *file_response;
                 char filepath[GIT_MAX_PATH];
                 char dirpath[GIT_MAX_PATH];
                 char progress_msg[GIT_MAX_ERRMSG];
                 char *decoded;
                 int decoded_len;
-                int content_len;
-                int fhttp;
 
                 updated++;
 
@@ -2406,47 +2487,14 @@ void *userdata;
                 report_progress(progress_fn, userdata, GIT_PROGRESS_DOWNLOAD,
                                 updated, 0, progress_msg);
 
-                file_response = (char *)malloc(GIT_RESPONSE_BUF);
-                if (!file_response) {
-                    elem = json_array_next(elem, &end);
-                    continue;
-                }
-
-                sprintf(api_path, "/repos/%s/%s/contents/%s?ref=%s",
-                        r->owner, r->repo, remote_path, r->branch);
-                fhttp = gh_api_request(r->token, "GET", api_path, NULL,
-                                       file_response, GIT_RESPONSE_BUF);
-
-                if (fhttp < 200 || fhttp >= 300) {
-                    free(file_response);
-                    elem = json_array_next(elem, &end);
-                    continue;
-                }
-
-                /* Check encoding */
-                val = json_find_string(file_response, "encoding", &len);
-                if (!val || len < 6 || strncmp(val, "base64", 6) != 0) {
-                    free(file_response);
-                    elem = json_array_next(elem, &end);
-                    continue;
-                }
-
-                val = json_find_string(file_response, "content", &content_len);
-                if (!val || content_len == 0) {
-                    free(file_response);
-                    elem = json_array_next(elem, &end);
-                    continue;
-                }
-
-                decoded = (char *)malloc(content_len + 1);
+                /* Download file via Contents API or Blobs API fallback */
+                decoded = gh_download_file(r->token, r->owner, r->repo,
+                                            remote_path, r->branch,
+                                            remote_sha, &decoded_len);
                 if (!decoded) {
-                    free(file_response);
                     elem = json_array_next(elem, &end);
                     continue;
                 }
-
-                decoded_len = gh_base64_decode(val, content_len, decoded,
-                                               content_len + 1);
 
                 /* Create dirs and write file */
                 sprintf(filepath, "%s/%s", r->local_path, remote_path);
@@ -2482,7 +2530,6 @@ void *userdata;
                 }
 
                 free(decoded);
-                free(file_response);
             }
 
             elem = json_array_next(elem, &end);

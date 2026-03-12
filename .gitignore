@@ -1,0 +1,13 @@
+# Crypto Ancienne TLS library (fetched via fetch_cryanc.sh)
+cryanc.c
+cryanc.h
+
+# Compiled binary
+git
+
+# Token file
+.github_token
+
+# Transfer helper scripts
+deploy.py
+ftp_server.py

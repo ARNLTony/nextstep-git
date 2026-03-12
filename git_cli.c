@@ -433,14 +433,6 @@ char *token;
         return 1;
     }
 
-    /* Refresh status first */
-    res = git_status(&repo, fl);
-    if (res.code != GIT_OK) {
-        fprintf(stderr, "error: %s\n", res.message);
-        free(fl);
-        return 1;
-    }
-
     /* "git add ." stages everything */
     if (argc == 2 && strcmp(argv[1], ".") == 0) {
         res = git_add_all(&repo, fl);

@@ -22,6 +22,8 @@
  *        ./git tag
  *        ./git tag <name>
  *        ./git tag -a <name> -m "message"
+ *        ./git release list
+ *        ./git release create <tag> [-t "title"] [-m "body"]
  *
  * (c) 2026 ARNLTony & Claude. MIT License.
  */
@@ -1325,6 +1327,116 @@ char *token;
     return 0;
 }
 
+/* --- Subcommand: release --- */
+
+static int cmd_release(argc, argv, token)
+int argc;
+char **argv;
+char *token;
+{
+    GitRepo repo;
+    GitFileList *fl;
+    GitResult res;
+    int i;
+
+    fl = (GitFileList *)malloc(sizeof(GitFileList));
+    if (!fl) {
+        fprintf(stderr, "fatal: out of memory\n");
+        return 1;
+    }
+
+    memset(&repo, 0, sizeof(repo));
+    memset(fl, 0, sizeof(GitFileList));
+
+    if (find_repo(&repo, fl, token) < 0) {
+        free(fl);
+        return 1;
+    }
+
+    if (argc < 2 || strcmp(argv[1], "list") == 0) {
+        /* List releases */
+        GitReleaseList *rl;
+
+        rl = (GitReleaseList *)malloc(sizeof(GitReleaseList));
+        if (!rl) {
+            fprintf(stderr, "fatal: out of memory\n");
+            free(fl);
+            return 1;
+        }
+        memset(rl, 0, sizeof(GitReleaseList));
+
+        res = git_release_list(&repo, rl);
+        if (res.code != GIT_OK) {
+            fprintf(stderr, "error: %s\n", res.message);
+            free(rl);
+            free(fl);
+            return 1;
+        }
+
+        if (rl->count == 0) {
+            printf("No releases found.\n");
+        } else {
+            for (i = 0; i < rl->count; i++) {
+                printf("  %s", rl->releases[i].tag_name);
+                if (rl->releases[i].name[0])
+                    printf("  \"%s\"", rl->releases[i].name);
+                if (rl->releases[i].draft)
+                    printf("  [draft]");
+                if (rl->releases[i].prerelease)
+                    printf("  [prerelease]");
+                printf("\n");
+            }
+        }
+
+        free(rl);
+    } else if (strcmp(argv[1], "create") == 0) {
+        /* Create release: git release create <tag> [-t title] [-m body] */
+        char *tag;
+        char *title;
+        char *body;
+
+        if (argc < 3) {
+            fprintf(stderr,
+                "usage: %s release create <tag> "
+                "[-t \"title\"] [-m \"body\"]\n", PROG_NAME);
+            free(fl);
+            return 1;
+        }
+
+        tag = argv[2];
+        title = NULL;
+        body = NULL;
+
+        for (i = 3; i < argc; i++) {
+            if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
+                title = argv[++i];
+            } else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
+                body = argv[++i];
+            }
+        }
+
+        res = git_release_create(&repo, tag, title, body);
+        if (res.code != GIT_OK) {
+            fprintf(stderr, "error: %s\n", res.message);
+            free(fl);
+            return 1;
+        }
+
+        printf("%s\n", res.message);
+    } else {
+        fprintf(stderr,
+            "usage: %s release list\n"
+            "   or: %s release create <tag> "
+            "[-t \"title\"] [-m \"body\"]\n",
+            PROG_NAME, PROG_NAME);
+        free(fl);
+        return 1;
+    }
+
+    free(fl);
+    return 0;
+}
+
 /* --- Help --- */
 
 static void cmd_help()
@@ -1351,6 +1463,8 @@ static void cmd_help()
     printf("    tag                                List tags\n");
     printf("    tag <name>                         Create lightweight tag\n");
     printf("    tag -a <name> -m \"msg\"              Create annotated tag\n");
+    printf("    release list                       List releases\n");
+    printf("    release create <tag> [-t -m]       Create release\n");
     printf("    help                               Show this help\n");
     printf("\n");
     printf("  Token: place your GitHub token in .github_token\n");
@@ -1434,6 +1548,9 @@ char **argv;
     }
     else if (strcmp(subcmd, "tag") == 0) {
         return cmd_tag(sub_argc, sub_argv, token);
+    }
+    else if (strcmp(subcmd, "release") == 0) {
+        return cmd_release(sub_argc, sub_argv, token);
     }
     else {
         fprintf(stderr, "'%s' is not a git command. See '%s help'.\n",

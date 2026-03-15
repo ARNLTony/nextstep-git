@@ -3377,6 +3377,180 @@ char *message;
     return result;
 }
 
+/* --- Release operations --- */
+
+/*
+ * List releases. Calls GET /repos/:o/:r/releases?per_page=20.
+ */
+GitResult git_release_list(r, out)
+GitRepo *r;
+GitReleaseList *out;
+{
+    GitResult result;
+    char *response;
+    char api_path[1024];
+    int http_status;
+    char *elem, *end;
+    char *val;
+    int len;
+
+    result.code = GIT_OK;
+    result.message[0] = '\0';
+    result.files_affected = 0;
+    out->count = 0;
+
+    response = (char *)malloc(GIT_RESPONSE_BUF);
+    if (!response) {
+        result.code = GIT_ERR_MEMORY;
+        sprintf(result.message, "Out of memory");
+        return result;
+    }
+
+    sprintf(api_path, "/repos/%s/%s/releases?per_page=%d",
+            r->owner, r->repo, GIT_MAX_RELEASES);
+    http_status = gh_api_request(r->token, "GET", api_path, NULL,
+                                 response, GIT_RESPONSE_BUF);
+
+    if (http_status < 200 || http_status >= 300) {
+        free(response);
+        result.code = (http_status == 404) ? GIT_ERR_NOTFOUND :
+                      GIT_ERR_NETWORK;
+        sprintf(result.message, "Failed to list releases (HTTP %d)",
+                http_status);
+        return result;
+    }
+
+    elem = json_array_first(response, &end);
+    while (elem && out->count < GIT_MAX_RELEASES) {
+        GitRelease *rel;
+
+        rel = &out->releases[out->count];
+
+        rel->id = json_find_number(elem, "id");
+
+        val = json_find_string(elem, "tag_name", &len);
+        if (val && len > 0 && len < GIT_MAX_BRANCH) {
+            json_unescape(val, len, rel->tag_name, GIT_MAX_BRANCH);
+        } else {
+            rel->tag_name[0] = '\0';
+        }
+
+        val = json_find_string(elem, "name", &len);
+        if (val && len > 0 && len < GIT_MAX_MSG) {
+            json_unescape(val, len, rel->name, GIT_MAX_MSG);
+        } else {
+            rel->name[0] = '\0';
+        }
+
+        val = json_find_string(elem, "body", &len);
+        if (val && len > 0 && len < GIT_MAX_MSG) {
+            json_unescape(val, len, rel->body, GIT_MAX_MSG);
+        } else {
+            rel->body[0] = '\0';
+        }
+
+        rel->draft = json_find_bool(elem, "draft");
+        rel->prerelease = json_find_bool(elem, "prerelease");
+        if (rel->draft < 0) rel->draft = 0;
+        if (rel->prerelease < 0) rel->prerelease = 0;
+
+        out->count++;
+        elem = json_array_next(elem, &end);
+    }
+
+    free(response);
+
+    result.files_affected = out->count;
+    sprintf(result.message, "%d releases", out->count);
+    return result;
+}
+
+/*
+ * Create a release. Calls POST /repos/:o/:r/releases.
+ * The tag must already exist.
+ */
+GitResult git_release_create(r, tag, title, body)
+GitRepo *r;
+char *tag;
+char *title;
+char *body;
+{
+    GitResult result;
+    char *response;
+    char api_path[1024];
+    char *post_body;
+    int http_status;
+
+    result.code = GIT_OK;
+    result.message[0] = '\0';
+    result.files_affected = 0;
+
+    if (!tag || !tag[0]) {
+        result.code = GIT_ERR_PARAM;
+        sprintf(result.message, "Tag name required");
+        return result;
+    }
+
+    response = (char *)malloc(GIT_RESPONSE_BUF);
+    post_body = (char *)malloc(GIT_MAX_MSG * 2 + 512);
+    if (!response || !post_body) {
+        if (response) free(response);
+        if (post_body) free(post_body);
+        result.code = GIT_ERR_MEMORY;
+        sprintf(result.message, "Out of memory");
+        return result;
+    }
+
+    {
+        char escaped_title[GIT_MAX_MSG];
+        char escaped_body[GIT_MAX_MSG];
+
+        if (title && title[0]) {
+            json_escape(title, escaped_title, GIT_MAX_MSG);
+        } else {
+            strcpy(escaped_title, tag);
+        }
+
+        if (body && body[0]) {
+            json_escape(body, escaped_body, GIT_MAX_MSG);
+        } else {
+            escaped_body[0] = '\0';
+        }
+
+        sprintf(post_body,
+            "{\"tag_name\":\"%s\",\"name\":\"%s\","
+            "\"body\":\"%s\",\"draft\":false,\"prerelease\":false}",
+            tag, escaped_title, escaped_body);
+    }
+
+    sprintf(api_path, "/repos/%s/%s/releases", r->owner, r->repo);
+    http_status = gh_api_request(r->token, "POST", api_path,
+                                 post_body, response, GIT_RESPONSE_BUF);
+
+    free(response);
+    free(post_body);
+
+    if (http_status == 201) {
+        sprintf(result.message,
+            "Created release '%s' for tag '%s'",
+            title ? title : tag, tag);
+    } else if (http_status == 422) {
+        result.code = GIT_ERR_CONFLICT;
+        sprintf(result.message,
+            "Release for tag '%s' already exists", tag);
+    } else if (http_status == 404) {
+        result.code = GIT_ERR_NOTFOUND;
+        sprintf(result.message,
+            "Tag '%s' not found (create it first)", tag);
+    } else {
+        result.code = GIT_ERR_NETWORK;
+        sprintf(result.message,
+            "Failed to create release (HTTP %d)", http_status);
+    }
+
+    return result;
+}
+
 /* --- Compare operations --- */
 
 /*

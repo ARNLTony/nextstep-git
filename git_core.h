@@ -28,6 +28,7 @@
 #define GIT_MAX_COMPARE_FILES 50
 #define GIT_MAX_PATCH       4096
 #define GIT_MAX_TAGS         50
+#define GIT_MAX_RELEASES     20
 #define GIT_STATE_FILE      ".nextstep_git"
 #define GIT_PENDING_FILE    ".nextstep_git_pending"
 
@@ -166,6 +167,20 @@ typedef struct GitTagList {
     int         count;
 } GitTagList;
 
+typedef struct GitRelease {
+    long    id;
+    char    tag_name[GIT_MAX_BRANCH];
+    char    name[GIT_MAX_MSG];
+    char    body[GIT_MAX_MSG];
+    int     draft;
+    int     prerelease;
+} GitRelease;
+
+typedef struct GitReleaseList {
+    GitRelease releases[GIT_MAX_RELEASES];
+    int        count;
+} GitReleaseList;
+
 typedef struct GitMergeResult {
     int     code;
     char    message[GIT_MAX_ERRMSG];
@@ -227,6 +242,13 @@ GitMergeResult git_merge(GitRepo *r, char *head_branch, char *message);
 GitResult git_tag_list(GitRepo *r, GitTagList *out);
 
 GitResult git_tag_create(GitRepo *r, char *name, char *message);
+
+/* --- Release operations --- */
+
+GitResult git_release_list(GitRepo *r, GitReleaseList *out);
+
+GitResult git_release_create(GitRepo *r, char *tag, char *title,
+                             char *body);
 
 /* --- Compare operations --- */
 

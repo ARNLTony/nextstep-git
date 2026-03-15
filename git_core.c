@@ -3172,6 +3172,199 @@ char *message;
     return result;
 }
 
+/* --- Compare operations --- */
+
+/*
+ * Compare two branches via GET /repos/:o/:r/compare/:base...:head.
+ * Parses status, ahead/behind counts, and file list with patches.
+ * Patches are heap-allocated and truncated to GIT_MAX_PATCH bytes.
+ */
+GitResult git_compare(r, base, head, out)
+GitRepo *r;
+char *base;
+char *head;
+GitCompareResult *out;
+{
+    GitResult result;
+    char *response;
+    char api_path[1024];
+    int http_status;
+    char *val;
+    int len;
+    char *elem, *end;
+    char *files_arr;
+
+    result.code = GIT_OK;
+    result.message[0] = '\0';
+    result.files_affected = 0;
+
+    out->status[0] = '\0';
+    out->ahead_by = 0;
+    out->behind_by = 0;
+    out->total_commits = 0;
+    out->files = NULL;
+    out->file_count = 0;
+
+    if (!base || !base[0] || !head || !head[0]) {
+        result.code = GIT_ERR_PARAM;
+        sprintf(result.message, "Both base and head are required");
+        return result;
+    }
+
+    response = (char *)malloc(GIT_RESPONSE_BUF);
+    if (!response) {
+        result.code = GIT_ERR_MEMORY;
+        sprintf(result.message, "Out of memory");
+        return result;
+    }
+
+    sprintf(api_path, "/repos/%s/%s/compare/%s...%s",
+            r->owner, r->repo, base, head);
+    http_status = gh_api_request(r->token, "GET", api_path, NULL,
+                                 response, GIT_RESPONSE_BUF);
+
+    if (http_status < 200 || http_status >= 300) {
+        free(response);
+        result.code = (http_status == 404) ? GIT_ERR_NOTFOUND :
+                      GIT_ERR_NETWORK;
+        sprintf(result.message,
+            "Compare failed (HTTP %d)", http_status);
+        return result;
+    }
+
+    /* Parse status */
+    val = json_find_string(response, "status", &len);
+    if (val && len > 0 && len < 16) {
+        strncpy(out->status, val, len);
+        out->status[len] = '\0';
+    }
+
+    /* Parse ahead/behind counts */
+    out->ahead_by = (int)json_find_number(response, "ahead_by");
+    out->behind_by = (int)json_find_number(response, "behind_by");
+    out->total_commits = (int)json_find_number(response, "total_commits");
+    if (out->ahead_by < 0) out->ahead_by = 0;
+    if (out->behind_by < 0) out->behind_by = 0;
+    if (out->total_commits < 0) out->total_commits = 0;
+
+    /* Parse files array */
+    files_arr = strstr(response, "\"files\"");
+    if (!files_arr) {
+        /* No files section — possibly identical */
+        free(response);
+        sprintf(result.message, "%s: %d commit(s), 0 files",
+                out->status, out->total_commits);
+        return result;
+    }
+
+    /* Count files first */
+    {
+        int count;
+        char *tmp_elem, *tmp_end;
+
+        count = 0;
+        tmp_elem = json_array_first(files_arr, &tmp_end);
+        while (tmp_elem && count < GIT_MAX_COMPARE_FILES) {
+            count++;
+            tmp_elem = json_array_next(tmp_elem, &tmp_end);
+        }
+
+        if (count == 0) {
+            free(response);
+            sprintf(result.message, "%s: %d commit(s), 0 files",
+                    out->status, out->total_commits);
+            return result;
+        }
+
+        out->files = (GitCompareFile *)malloc(
+            count * sizeof(GitCompareFile));
+        if (!out->files) {
+            free(response);
+            result.code = GIT_ERR_MEMORY;
+            sprintf(result.message, "Out of memory");
+            return result;
+        }
+        memset(out->files, 0, count * sizeof(GitCompareFile));
+    }
+
+    /* Parse each file entry */
+    elem = json_array_first(files_arr, &end);
+    while (elem && out->file_count < GIT_MAX_COMPARE_FILES) {
+        GitCompareFile *f;
+
+        f = &out->files[out->file_count];
+
+        /* filename */
+        val = json_find_string(elem, "filename", &len);
+        if (val && len > 0 && len < GIT_MAX_PATH) {
+            json_unescape(val, len, f->filename, GIT_MAX_PATH);
+        } else {
+            f->filename[0] = '\0';
+        }
+
+        /* status */
+        val = json_find_string(elem, "status", &len);
+        if (val && len > 0 && len < 16) {
+            strncpy(f->status, val, len);
+            f->status[len] = '\0';
+        } else {
+            strcpy(f->status, "changed");
+        }
+
+        /* additions / deletions */
+        f->additions = (int)json_find_number(elem, "additions");
+        f->deletions = (int)json_find_number(elem, "deletions");
+        if (f->additions < 0) f->additions = 0;
+        if (f->deletions < 0) f->deletions = 0;
+
+        /* patch text (heap-allocated, truncated) */
+        val = json_find_string(elem, "patch", &len);
+        if (val && len > 0) {
+            int patch_len;
+
+            patch_len = (len > GIT_MAX_PATCH - 1) ?
+                        GIT_MAX_PATCH - 1 : len;
+            f->patch = (char *)malloc(patch_len + 1);
+            if (f->patch) {
+                json_unescape(val, patch_len, f->patch, patch_len + 1);
+            }
+        } else {
+            f->patch = NULL;
+        }
+
+        out->file_count++;
+        elem = json_array_next(elem, &end);
+    }
+
+    free(response);
+
+    result.files_affected = out->file_count;
+    sprintf(result.message, "%s: %d commit(s), %d file(s) changed",
+            out->status, out->total_commits, out->file_count);
+    return result;
+}
+
+/*
+ * Free heap-allocated compare result.
+ */
+void git_compare_free(result)
+GitCompareResult *result;
+{
+    int i;
+
+    if (result->files) {
+        for (i = 0; i < result->file_count; i++) {
+            if (result->files[i].patch) {
+                free(result->files[i].patch);
+                result->files[i].patch = NULL;
+            }
+        }
+        free(result->files);
+        result->files = NULL;
+    }
+    result->file_count = 0;
+}
+
 /* --- git_log --- */
 
 GitResult git_log(r, max_count, out)

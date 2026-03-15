@@ -13,6 +13,7 @@
  *        ./git pull
  *        ./git log [-n count]
  *        ./git diff [file]
+ *        ./git diff base..head
  *        ./git branch
  *        ./git branch <name>
  *        ./git branch -d <name>
@@ -728,6 +729,86 @@ char *token;
     char *filepath;
     int i;
 
+    /* Check for branch compare syntax: diff base..head */
+    if (argc >= 2 && strstr(argv[1], "..") != NULL) {
+        GitCompareResult cmp;
+        char base[GIT_MAX_BRANCH];
+        char head[GIT_MAX_BRANCH];
+        char *dots;
+        int base_len;
+
+        dots = strstr(argv[1], "..");
+        base_len = dots - argv[1];
+        if (base_len <= 0 || base_len >= GIT_MAX_BRANCH) {
+            fprintf(stderr, "error: invalid base branch\n");
+            return 1;
+        }
+        strncpy(base, argv[1], base_len);
+        base[base_len] = '\0';
+        strncpy(head, dots + 2, GIT_MAX_BRANCH - 1);
+        head[GIT_MAX_BRANCH - 1] = '\0';
+
+        if (head[0] == '\0') {
+            fprintf(stderr,
+                "usage: %s diff <base>..<head>\n", PROG_NAME);
+            return 1;
+        }
+
+        fl = (GitFileList *)malloc(sizeof(GitFileList));
+        if (!fl) {
+            fprintf(stderr, "fatal: out of memory\n");
+            return 1;
+        }
+        memset(&repo, 0, sizeof(repo));
+        memset(fl, 0, sizeof(GitFileList));
+
+        if (find_repo(&repo, fl, token) < 0) {
+            free(fl);
+            return 1;
+        }
+        free(fl);
+
+        printf("Comparing %s...%s\n\n", base, head);
+
+        memset(&cmp, 0, sizeof(cmp));
+        res = git_compare(&repo, base, head, &cmp);
+        if (res.code != GIT_OK) {
+            fprintf(stderr, "error: %s\n", res.message);
+            return 1;
+        }
+
+        /* Summary */
+        printf("%s\n", res.message);
+        if (cmp.ahead_by > 0)
+            printf("  %s is %d commit(s) ahead of %s\n",
+                   head, cmp.ahead_by, base);
+        if (cmp.behind_by > 0)
+            printf("  %s is %d commit(s) behind %s\n",
+                   head, cmp.behind_by, base);
+        printf("\n");
+
+        /* File list */
+        for (i = 0; i < cmp.file_count; i++) {
+            printf("%-10s %s", cmp.files[i].status,
+                   cmp.files[i].filename);
+            if (cmp.files[i].additions > 0 ||
+                cmp.files[i].deletions > 0) {
+                printf("  (+%d/-%d)",
+                       cmp.files[i].additions,
+                       cmp.files[i].deletions);
+            }
+            printf("\n");
+
+            /* Show patch if available */
+            if (cmp.files[i].patch) {
+                printf("%s\n\n", cmp.files[i].patch);
+            }
+        }
+
+        git_compare_free(&cmp);
+        return 0;
+    }
+
     fl = (GitFileList *)malloc(sizeof(GitFileList));
     if (!fl) {
         fprintf(stderr, "fatal: out of memory\n");
@@ -1143,7 +1224,8 @@ static void cmd_help()
     printf("    push                               Push to GitHub\n");
     printf("    pull                               Pull from GitHub\n");
     printf("    log [-n count]                     Show commit history\n");
-    printf("    diff [file]                        Show differences\n");
+    printf("    diff [file]                        Show local differences\n");
+    printf("    diff <base>..<head>                Compare branches\n");
     printf("    branch                             List branches\n");
     printf("    branch <name>                      Create branch\n");
     printf("    branch -d <name>                   Delete branch\n");

@@ -25,6 +25,8 @@
 #define GIT_MAX_ERRMSG      512
 #define GIT_MAX_COMMITS     100
 #define GIT_MAX_BRANCHES     50
+#define GIT_MAX_COMPARE_FILES 50
+#define GIT_MAX_PATCH       4096
 #define GIT_STATE_FILE      ".nextstep_git"
 #define GIT_PENDING_FILE    ".nextstep_git_pending"
 
@@ -134,6 +136,23 @@ typedef struct GitBranchList {
     int            count;
 } GitBranchList;
 
+typedef struct GitCompareFile {
+    char    filename[GIT_MAX_PATH];
+    char    status[16];             /* "added", "removed", "modified", "renamed" */
+    int     additions;
+    int     deletions;
+    char    *patch;                 /* heap-allocated patch text, may be NULL */
+} GitCompareFile;
+
+typedef struct GitCompareResult {
+    char    status[16];             /* "ahead", "behind", "diverged", "identical" */
+    int     ahead_by;
+    int     behind_by;
+    int     total_commits;
+    GitCompareFile *files;          /* heap-allocated array */
+    int     file_count;
+} GitCompareResult;
+
 typedef struct GitMergeResult {
     int     code;
     char    message[GIT_MAX_ERRMSG];
@@ -189,6 +208,12 @@ GitResult git_branch_delete(GitRepo *r, char *name);
 /* --- Merge operations --- */
 
 GitMergeResult git_merge(GitRepo *r, char *head_branch, char *message);
+
+/* --- Compare operations --- */
+
+GitResult git_compare(GitRepo *r, char *base, char *head,
+                      GitCompareResult *out);
+void git_compare_free(GitCompareResult *result);
 
 /* --- State persistence --- */
 

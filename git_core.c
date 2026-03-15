@@ -2558,6 +2558,510 @@ void *userdata;
     return result;
 }
 
+/* --- Branch operations --- */
+
+/*
+ * List remote branches. Calls GET /repos/:o/:r/branches?per_page=50
+ * and marks the current branch (from r->branch) with is_current=1.
+ */
+GitResult git_branch_list(r, out)
+GitRepo *r;
+GitBranchList *out;
+{
+    GitResult result;
+    char *response;
+    char api_path[1024];
+    int http_status;
+    char *elem, *end;
+    char *val;
+    int len;
+
+    result.code = GIT_OK;
+    result.message[0] = '\0';
+    result.files_affected = 0;
+    out->count = 0;
+
+    response = (char *)malloc(GIT_RESPONSE_BUF);
+    if (!response) {
+        result.code = GIT_ERR_MEMORY;
+        sprintf(result.message, "Out of memory");
+        return result;
+    }
+
+    sprintf(api_path, "/repos/%s/%s/branches?per_page=%d",
+            r->owner, r->repo, GIT_MAX_BRANCHES);
+    http_status = gh_api_request(r->token, "GET", api_path, NULL,
+                                 response, GIT_RESPONSE_BUF);
+
+    if (http_status < 200 || http_status >= 300) {
+        free(response);
+        result.code = (http_status == 404) ? GIT_ERR_NOTFOUND :
+                      (http_status == 401 || http_status == 403) ? GIT_ERR_AUTH :
+                      GIT_ERR_NETWORK;
+        sprintf(result.message, "Failed to list branches (HTTP %d)", http_status);
+        return result;
+    }
+
+    /* Parse JSON array of branch objects */
+    elem = json_array_first(response, &end);
+    while (elem && out->count < GIT_MAX_BRANCHES) {
+        val = json_find_string(elem, "name", &len);
+        if (val && len > 0 && len < GIT_MAX_BRANCH) {
+            json_unescape(val, len, out->branches[out->count].name,
+                          GIT_MAX_BRANCH);
+
+            /* Get commit SHA (nested: commit.sha) */
+            val = json_find_string(elem, "sha", &len);
+            if (val && len > 0 && len < GIT_MAX_SHA) {
+                strncpy(out->branches[out->count].sha, val, len);
+                out->branches[out->count].sha[len] = '\0';
+            } else {
+                out->branches[out->count].sha[0] = '\0';
+            }
+
+            out->branches[out->count].is_current =
+                (strcmp(out->branches[out->count].name, r->branch) == 0);
+
+            out->count++;
+        }
+        elem = json_array_next(elem, &end);
+    }
+
+    free(response);
+
+    result.files_affected = out->count;
+    sprintf(result.message, "%d branches", out->count);
+    return result;
+}
+
+/*
+ * Create a new branch. POSTs to /repos/:o/:r/git/refs with
+ * {"ref":"refs/heads/<name>","sha":"<from_sha>"}.
+ * If from_sha is NULL, uses r->head_sha.
+ */
+GitResult git_branch_create(r, name, from_sha)
+GitRepo *r;
+char *name;
+char *from_sha;
+{
+    GitResult result;
+    char *response;
+    char api_path[1024];
+    char post_body[512];
+    int http_status;
+    char *sha;
+
+    result.code = GIT_OK;
+    result.message[0] = '\0';
+    result.files_affected = 0;
+
+    if (!name || !name[0]) {
+        result.code = GIT_ERR_PARAM;
+        sprintf(result.message, "Branch name required");
+        return result;
+    }
+
+    sha = (from_sha && from_sha[0]) ? from_sha : r->head_sha;
+    if (!sha[0]) {
+        result.code = GIT_ERR_STATE;
+        sprintf(result.message, "No HEAD SHA available");
+        return result;
+    }
+
+    response = (char *)malloc(GIT_RESPONSE_BUF);
+    if (!response) {
+        result.code = GIT_ERR_MEMORY;
+        sprintf(result.message, "Out of memory");
+        return result;
+    }
+
+    sprintf(api_path, "/repos/%s/%s/git/refs", r->owner, r->repo);
+    sprintf(post_body, "{\"ref\":\"refs/heads/%s\",\"sha\":\"%s\"}", name, sha);
+
+    http_status = gh_api_request(r->token, "POST", api_path, post_body,
+                                 response, GIT_RESPONSE_BUF);
+
+    free(response);
+
+    if (http_status == 201) {
+        sprintf(result.message, "Branch '%s' created", name);
+    } else if (http_status == 422) {
+        result.code = GIT_ERR_CONFLICT;
+        sprintf(result.message, "Branch '%s' already exists", name);
+    } else {
+        result.code = GIT_ERR_NETWORK;
+        sprintf(result.message, "Failed to create branch (HTTP %d)", http_status);
+    }
+
+    return result;
+}
+
+/*
+ * Switch to a different branch. Steps:
+ * 1. Verify branch exists (GET ref)
+ * 2. Get remote tree for target branch
+ * 3. Compare with current tracked files, download changed/new files
+ * 4. Update r->branch, r->head_sha, r->tree_sha, save state
+ *
+ * Refuses to switch if there are uncommitted staged changes.
+ */
+GitResult git_branch_switch(r, name, fl, progress_fn, userdata)
+GitRepo *r;
+char *name;
+GitFileList *fl;
+GitProgressFn progress_fn;
+void *userdata;
+{
+    GitResult result;
+    char *response;
+    char api_path[1024];
+    int http_status;
+    char *val;
+    int len;
+    char new_head[GIT_MAX_SHA];
+    char new_tree_sha[GIT_MAX_SHA];
+    char *elem, *end;
+    int i, j;
+    int updated;
+    char type_buf[32];
+    typedef char PathBuf[GIT_MAX_PATH];
+    typedef char ShaBuf[GIT_MAX_SHA];
+    PathBuf *remote_paths;
+    ShaBuf *remote_shas;
+    int remote_count;
+
+    result.code = GIT_OK;
+    result.message[0] = '\0';
+    result.files_affected = 0;
+
+    if (!name || !name[0]) {
+        result.code = GIT_ERR_PARAM;
+        sprintf(result.message, "Branch name required");
+        return result;
+    }
+
+    /* Already on this branch? */
+    if (strcmp(r->branch, name) == 0) {
+        sprintf(result.message, "Already on branch '%s'", name);
+        return result;
+    }
+
+    /* Check for staged changes */
+    for (i = 0; i < fl->count; i++) {
+        if (fl->files[i].status == GIT_STATUS_STAGED) {
+            result.code = GIT_ERR_CONFLICT;
+            sprintf(result.message,
+                "Cannot switch branches: you have staged changes.\n"
+                "Commit or unstage them first.");
+            return result;
+        }
+    }
+
+    response = (char *)malloc(GIT_RESPONSE_BUF);
+    if (!response) {
+        result.code = GIT_ERR_MEMORY;
+        sprintf(result.message, "Out of memory");
+        return result;
+    }
+
+    remote_paths = (PathBuf *)malloc(GIT_MAX_FILES * sizeof(PathBuf));
+    remote_shas = (ShaBuf *)malloc(GIT_MAX_FILES * sizeof(ShaBuf));
+    if (!remote_paths || !remote_shas) {
+        free(response);
+        if (remote_paths) free(remote_paths);
+        if (remote_shas) free(remote_shas);
+        result.code = GIT_ERR_MEMORY;
+        sprintf(result.message, "Out of memory");
+        return result;
+    }
+
+    /* Step 1: Get target branch ref */
+    report_progress(progress_fn, userdata, GIT_PROGRESS_START,
+                    0, 0, "Getting branch info...");
+
+    sprintf(api_path, "/repos/%s/%s/git/refs/heads/%s",
+            r->owner, r->repo, name);
+    http_status = gh_api_request(r->token, "GET", api_path, NULL,
+                                 response, GIT_RESPONSE_BUF);
+
+    if (http_status < 200 || http_status >= 300) {
+        free(response); free(remote_paths); free(remote_shas);
+        result.code = (http_status == 404) ? GIT_ERR_NOTFOUND : GIT_ERR_NETWORK;
+        sprintf(result.message, "Branch '%s' not found (HTTP %d)", name, http_status);
+        return result;
+    }
+
+    val = json_find_string(response, "sha", &len);
+    if (!val || len < 1) {
+        free(response); free(remote_paths); free(remote_shas);
+        result.code = GIT_ERR_NETWORK;
+        sprintf(result.message, "Could not parse branch ref");
+        return result;
+    }
+    if (len > GIT_MAX_SHA - 1) len = GIT_MAX_SHA - 1;
+    strncpy(new_head, val, len);
+    new_head[len] = '\0';
+
+    /* Step 2: Get target branch tree */
+    report_progress(progress_fn, userdata, GIT_PROGRESS_STATUS,
+                    0, 0, "Getting file tree...");
+
+    sprintf(api_path, "/repos/%s/%s/git/trees/%s?recursive=1",
+            r->owner, r->repo, new_head);
+    http_status = gh_api_request(r->token, "GET", api_path, NULL,
+                                 response, GIT_RESPONSE_BUF);
+
+    if (http_status < 200 || http_status >= 300) {
+        free(response); free(remote_paths); free(remote_shas);
+        result.code = GIT_ERR_NETWORK;
+        sprintf(result.message, "Failed to get tree (HTTP %d)", http_status);
+        return result;
+    }
+
+    /* Get tree SHA */
+    val = json_find_string(response, "sha", &len);
+    if (val && len > 0 && len < GIT_MAX_SHA) {
+        strncpy(new_tree_sha, val, len);
+        new_tree_sha[len] = '\0';
+    } else {
+        new_tree_sha[0] = '\0';
+    }
+
+    /* Parse remote tree entries */
+    remote_count = 0;
+    {
+        char *tree_arr;
+
+        tree_arr = strstr(response, "\"tree\"");
+        if (!tree_arr) {
+            free(response); free(remote_paths); free(remote_shas);
+            result.code = GIT_ERR_NETWORK;
+            sprintf(result.message, "No tree array in response");
+            return result;
+        }
+
+        elem = json_array_first(tree_arr, &end);
+        while (elem && remote_count < GIT_MAX_FILES) {
+            val = json_find_string(elem, "type", &len);
+            if (val && len > 0) {
+                if (len > (int)sizeof(type_buf) - 1) len = sizeof(type_buf) - 1;
+                strncpy(type_buf, val, len);
+                type_buf[len] = '\0';
+
+                if (strcmp(type_buf, "blob") == 0) {
+                    val = json_find_string(elem, "path", &len);
+                    if (val && len > 0 && len < GIT_MAX_PATH) {
+                        json_unescape(val, len, remote_paths[remote_count],
+                                      GIT_MAX_PATH);
+
+                        val = json_find_string(elem, "sha", &len);
+                        if (val && len > 0 && len < GIT_MAX_SHA) {
+                            strncpy(remote_shas[remote_count], val, len);
+                            remote_shas[remote_count][len] = '\0';
+                        } else {
+                            remote_shas[remote_count][0] = '\0';
+                        }
+                        remote_count++;
+                    }
+                }
+            }
+            elem = json_array_next(elem, &end);
+        }
+    }
+
+    /* Step 3: Download changed/new files */
+    updated = 0;
+    for (i = 0; i < remote_count; i++) {
+        int found;
+        int match_idx;
+
+        /* Check if file exists in current state with same SHA */
+        found = 0;
+        match_idx = -1;
+        for (j = 0; j < fl->count; j++) {
+            if (strcmp(fl->files[j].path, remote_paths[i]) == 0) {
+                found = 1;
+                match_idx = j;
+                break;
+            }
+        }
+
+        /* If file exists locally and SHA matches the remote blob SHA,
+         * we still need to check — the state stores content_hash not
+         * git blob SHA. So for branch switch, always download files
+         * that don't exist locally or whose blob SHA differs from
+         * what we had. For efficiency, if the remote blob SHA matches
+         * what the other branch had, skip it.
+         *
+         * Simple approach: download if file is new or if blob SHA
+         * changed from what we last pulled. We don't store blob SHAs
+         * in state (we store content hashes), so for branch switch
+         * we re-download all files. This is correct but slow.
+         *
+         * Optimization: only download if file doesn't exist on disk. */
+        if (found) {
+            /* File exists in our state — check if it exists on disk
+             * and skip download if so (the pull after switch will
+             * catch any diffs). For a proper switch, we should compare
+             * blob SHAs, but we don't store them. Download all for
+             * correctness on first implementation. */
+        }
+
+        {
+            char filepath[GIT_MAX_PATH];
+            char dirpath[GIT_MAX_PATH];
+            char progress_msg[GIT_MAX_ERRMSG];
+            char *decoded;
+            int decoded_len;
+
+            updated++;
+            sprintf(progress_msg, "%s (%d/%d)",
+                    remote_paths[i], updated, remote_count);
+            report_progress(progress_fn, userdata, GIT_PROGRESS_DOWNLOAD,
+                            updated, remote_count, progress_msg);
+
+            decoded = gh_download_file(r->token, r->owner, r->repo,
+                                        remote_paths[i], name,
+                                        remote_shas[i], &decoded_len);
+            if (!decoded) continue;
+
+            sprintf(filepath, "%s/%s", r->local_path, remote_paths[i]);
+            path_dirname(filepath, dirpath, GIT_MAX_PATH);
+            if (dirpath[0] && !git_is_directory(dirpath)) {
+                git_mkdir_p(dirpath);
+            }
+
+            if (git_write_file(filepath, decoded, (long)decoded_len) == 0) {
+                char local_hash[GIT_MAX_SHA];
+                content_hash(decoded, (long)decoded_len, local_hash);
+                if (found && match_idx >= 0) {
+                    strncpy(fl->files[match_idx].sha, local_hash,
+                            GIT_MAX_SHA - 1);
+                    fl->files[match_idx].status = GIT_STATUS_TRACKED;
+                    fl->files[match_idx].size = (long)decoded_len;
+                } else {
+                    if (fl->count < GIT_MAX_FILES) {
+                        strncpy(fl->files[fl->count].path,
+                                remote_paths[i], GIT_MAX_PATH - 1);
+                        strncpy(fl->files[fl->count].sha,
+                                local_hash, GIT_MAX_SHA - 1);
+                        fl->files[fl->count].status = GIT_STATUS_TRACKED;
+                        fl->files[fl->count].size = (long)decoded_len;
+                        fl->count++;
+                    }
+                }
+                result.files_affected++;
+            }
+
+            free(decoded);
+        }
+    }
+
+    /* Step 4: Remove local files not in remote tree */
+    for (j = fl->count - 1; j >= 0; j--) {
+        int in_remote;
+
+        in_remote = 0;
+        for (i = 0; i < remote_count; i++) {
+            if (strcmp(fl->files[j].path, remote_paths[i]) == 0) {
+                in_remote = 1;
+                break;
+            }
+        }
+
+        if (!in_remote) {
+            char filepath[GIT_MAX_PATH];
+            sprintf(filepath, "%s/%s", r->local_path, fl->files[j].path);
+            unlink(filepath);
+
+            /* Remove from file list by shifting */
+            for (i = j; i < fl->count - 1; i++) {
+                fl->files[i] = fl->files[i + 1];
+            }
+            fl->count--;
+        }
+    }
+
+    /* Update repo state */
+    strncpy(r->branch, name, GIT_MAX_BRANCH - 1);
+    r->branch[GIT_MAX_BRANCH - 1] = '\0';
+    strcpy(r->head_sha, new_head);
+    strcpy(r->tree_sha, new_tree_sha);
+    git_save_state(r, fl);
+
+    free(response);
+    free(remote_paths);
+    free(remote_shas);
+
+    report_progress(progress_fn, userdata, GIT_PROGRESS_DONE,
+                    0, 0, "Branch switch complete");
+
+    sprintf(result.message, "Switched to branch '%s' (%d files updated)",
+            name, result.files_affected);
+    return result;
+}
+
+/*
+ * Delete a remote branch. Calls DELETE /repos/:o/:r/git/refs/heads/<name>.
+ * Refuses to delete the current branch.
+ */
+GitResult git_branch_delete(r, name)
+GitRepo *r;
+char *name;
+{
+    GitResult result;
+    char *response;
+    char api_path[1024];
+    int http_status;
+
+    result.code = GIT_OK;
+    result.message[0] = '\0';
+    result.files_affected = 0;
+
+    if (!name || !name[0]) {
+        result.code = GIT_ERR_PARAM;
+        sprintf(result.message, "Branch name required");
+        return result;
+    }
+
+    /* Refuse to delete current branch */
+    if (strcmp(r->branch, name) == 0) {
+        result.code = GIT_ERR_PARAM;
+        sprintf(result.message, "Cannot delete the current branch '%s'", name);
+        return result;
+    }
+
+    response = (char *)malloc(GIT_RESPONSE_BUF);
+    if (!response) {
+        result.code = GIT_ERR_MEMORY;
+        sprintf(result.message, "Out of memory");
+        return result;
+    }
+
+    sprintf(api_path, "/repos/%s/%s/git/refs/heads/%s",
+            r->owner, r->repo, name);
+    http_status = gh_api_request(r->token, "DELETE", api_path, NULL,
+                                 response, GIT_RESPONSE_BUF);
+
+    free(response);
+
+    if (http_status == 204) {
+        sprintf(result.message, "Deleted branch '%s'", name);
+    } else if (http_status == 404) {
+        result.code = GIT_ERR_NOTFOUND;
+        sprintf(result.message, "Branch '%s' not found", name);
+    } else if (http_status == 422) {
+        result.code = GIT_ERR_PARAM;
+        sprintf(result.message,
+            "Cannot delete branch '%s' (may be protected)", name);
+    } else {
+        result.code = GIT_ERR_NETWORK;
+        sprintf(result.message, "Failed to delete branch (HTTP %d)", http_status);
+    }
+
+    return result;
+}
+
 /* --- git_log --- */
 
 GitResult git_log(r, max_count, out)

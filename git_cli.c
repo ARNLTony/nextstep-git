@@ -13,6 +13,10 @@
  *        ./git pull
  *        ./git log [-n count]
  *        ./git diff [file]
+ *        ./git branch
+ *        ./git branch <name>
+ *        ./git branch -d <name>
+ *        ./git checkout <branch>
  *
  * (c) 2026 ARNLTony & Claude. MIT License.
  */
@@ -900,6 +904,137 @@ char *token;
     return 0;
 }
 
+/* --- Subcommand: branch --- */
+
+static int cmd_branch(argc, argv, token)
+int argc;
+char **argv;
+char *token;
+{
+    GitRepo repo;
+    GitFileList *fl;
+    GitResult res;
+    int i;
+
+    fl = (GitFileList *)malloc(sizeof(GitFileList));
+    if (!fl) {
+        fprintf(stderr, "fatal: out of memory\n");
+        return 1;
+    }
+
+    memset(&repo, 0, sizeof(repo));
+    memset(fl, 0, sizeof(GitFileList));
+
+    if (find_repo(&repo, fl, token) < 0) {
+        free(fl);
+        return 1;
+    }
+
+    if (argc >= 2 && strcmp(argv[1], "-d") == 0) {
+        /* Delete branch: git branch -d <name> */
+        if (argc < 3) {
+            fprintf(stderr, "usage: %s branch -d <branch-name>\n", PROG_NAME);
+            free(fl);
+            return 1;
+        }
+        res = git_branch_delete(&repo, argv[2]);
+        if (res.code != GIT_OK) {
+            fprintf(stderr, "error: %s\n", res.message);
+            free(fl);
+            return 1;
+        }
+        printf("%s\n", res.message);
+    } else if (argc >= 2) {
+        /* Create branch: git branch <name> */
+        res = git_branch_create(&repo, argv[1], NULL);
+        if (res.code != GIT_OK) {
+            fprintf(stderr, "error: %s\n", res.message);
+            free(fl);
+            return 1;
+        }
+        printf("%s\n", res.message);
+    } else {
+        /* List branches: git branch */
+        GitBranchList *bl;
+
+        bl = (GitBranchList *)malloc(sizeof(GitBranchList));
+        if (!bl) {
+            fprintf(stderr, "fatal: out of memory\n");
+            free(fl);
+            return 1;
+        }
+        memset(bl, 0, sizeof(GitBranchList));
+
+        res = git_branch_list(&repo, bl);
+        if (res.code != GIT_OK) {
+            fprintf(stderr, "error: %s\n", res.message);
+            free(bl);
+            free(fl);
+            return 1;
+        }
+
+        if (bl->count == 0) {
+            printf("No branches found.\n");
+        } else {
+            for (i = 0; i < bl->count; i++) {
+                if (bl->branches[i].is_current)
+                    printf("* %s\n", bl->branches[i].name);
+                else
+                    printf("  %s\n", bl->branches[i].name);
+            }
+        }
+
+        free(bl);
+    }
+
+    free(fl);
+    return 0;
+}
+
+/* --- Subcommand: checkout --- */
+
+static int cmd_checkout(argc, argv, token)
+int argc;
+char **argv;
+char *token;
+{
+    GitRepo repo;
+    GitFileList *fl;
+    GitResult res;
+
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s checkout <branch>\n", PROG_NAME);
+        return 1;
+    }
+
+    fl = (GitFileList *)malloc(sizeof(GitFileList));
+    if (!fl) {
+        fprintf(stderr, "fatal: out of memory\n");
+        return 1;
+    }
+
+    memset(&repo, 0, sizeof(repo));
+    memset(fl, 0, sizeof(GitFileList));
+
+    if (find_repo(&repo, fl, token) < 0) {
+        free(fl);
+        return 1;
+    }
+
+    printf("Switching to branch '%s'...\n", argv[1]);
+
+    res = git_branch_switch(&repo, argv[1], fl, cli_progress, NULL);
+    if (res.code != GIT_OK) {
+        fprintf(stderr, "error: %s\n", res.message);
+        free(fl);
+        return 1;
+    }
+
+    printf("\n%s\n", res.message);
+    free(fl);
+    return 0;
+}
+
 /* --- Help --- */
 
 static void cmd_help()
@@ -917,6 +1052,10 @@ static void cmd_help()
     printf("    pull                               Pull from GitHub\n");
     printf("    log [-n count]                     Show commit history\n");
     printf("    diff [file]                        Show differences\n");
+    printf("    branch                             List branches\n");
+    printf("    branch <name>                      Create branch\n");
+    printf("    branch -d <name>                   Delete branch\n");
+    printf("    checkout <branch>                  Switch branch\n");
     printf("    help                               Show this help\n");
     printf("\n");
     printf("  Token: place your GitHub token in .github_token\n");
@@ -988,6 +1127,12 @@ char **argv;
     }
     else if (strcmp(subcmd, "diff") == 0) {
         return cmd_diff(sub_argc, sub_argv, token);
+    }
+    else if (strcmp(subcmd, "branch") == 0) {
+        return cmd_branch(sub_argc, sub_argv, token);
+    }
+    else if (strcmp(subcmd, "checkout") == 0) {
+        return cmd_checkout(sub_argc, sub_argv, token);
     }
     else {
         fprintf(stderr, "'%s' is not a git command. See '%s help'.\n",

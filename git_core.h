@@ -24,6 +24,7 @@
 #define GIT_MAX_DATE         32
 #define GIT_MAX_ERRMSG      512
 #define GIT_MAX_COMMITS     100
+#define GIT_MAX_BRANCHES     50
 #define GIT_STATE_FILE      ".nextstep_git"
 #define GIT_PENDING_FILE    ".nextstep_git_pending"
 
@@ -122,6 +123,17 @@ typedef struct GitDiffResult {
     int          count;
 } GitDiffResult;
 
+typedef struct GitBranchEntry {
+    char    name[GIT_MAX_BRANCH];
+    char    sha[GIT_MAX_SHA];
+    int     is_current;
+} GitBranchEntry;
+
+typedef struct GitBranchList {
+    GitBranchEntry branches[GIT_MAX_BRANCHES];
+    int            count;
+} GitBranchList;
+
 typedef struct GitResult {
     int     code;
     char    message[GIT_MAX_ERRMSG];
@@ -155,6 +167,17 @@ GitResult git_log(GitRepo *r, int max_count, GitCommitLog *out);
 GitResult git_diff(GitRepo *r, char *path, GitFileList *state,
                    GitDiffResult *out,
                    GitProgressFn progress_fn, void *userdata);
+
+/* --- Branch operations --- */
+
+GitResult git_branch_list(GitRepo *r, GitBranchList *out);
+
+GitResult git_branch_create(GitRepo *r, char *name, char *from_sha);
+
+GitResult git_branch_switch(GitRepo *r, char *name, GitFileList *fl,
+                            GitProgressFn progress_fn, void *userdata);
+
+GitResult git_branch_delete(GitRepo *r, char *name);
 
 /* --- State persistence --- */
 

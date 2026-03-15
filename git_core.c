@@ -3172,6 +3172,211 @@ char *message;
     return result;
 }
 
+/* --- Tag operations --- */
+
+/*
+ * List tags. Calls GET /repos/:o/:r/tags?per_page=50.
+ */
+GitResult git_tag_list(r, out)
+GitRepo *r;
+GitTagList *out;
+{
+    GitResult result;
+    char *response;
+    char api_path[1024];
+    int http_status;
+    char *elem, *end;
+    char *val;
+    int len;
+
+    result.code = GIT_OK;
+    result.message[0] = '\0';
+    result.files_affected = 0;
+    out->count = 0;
+
+    response = (char *)malloc(GIT_RESPONSE_BUF);
+    if (!response) {
+        result.code = GIT_ERR_MEMORY;
+        sprintf(result.message, "Out of memory");
+        return result;
+    }
+
+    sprintf(api_path, "/repos/%s/%s/tags?per_page=%d",
+            r->owner, r->repo, GIT_MAX_TAGS);
+    http_status = gh_api_request(r->token, "GET", api_path, NULL,
+                                 response, GIT_RESPONSE_BUF);
+
+    if (http_status < 200 || http_status >= 300) {
+        free(response);
+        result.code = (http_status == 404) ? GIT_ERR_NOTFOUND :
+                      GIT_ERR_NETWORK;
+        sprintf(result.message, "Failed to list tags (HTTP %d)",
+                http_status);
+        return result;
+    }
+
+    /* Parse JSON array of tag objects */
+    elem = json_array_first(response, &end);
+    while (elem && out->count < GIT_MAX_TAGS) {
+        val = json_find_string(elem, "name", &len);
+        if (val && len > 0 && len < GIT_MAX_BRANCH) {
+            json_unescape(val, len, out->tags[out->count].name,
+                          GIT_MAX_BRANCH);
+
+            /* Get commit SHA (nested: commit.sha) */
+            val = json_find_string(elem, "sha", &len);
+            if (val && len > 0 && len < GIT_MAX_SHA) {
+                strncpy(out->tags[out->count].sha, val, len);
+                out->tags[out->count].sha[len] = '\0';
+            } else {
+                out->tags[out->count].sha[0] = '\0';
+            }
+
+            out->tags[out->count].message[0] = '\0';
+            out->tags[out->count].is_annotated = 0;
+            out->count++;
+        }
+        elem = json_array_next(elem, &end);
+    }
+
+    free(response);
+
+    result.files_affected = out->count;
+    sprintf(result.message, "%d tags", out->count);
+    return result;
+}
+
+/*
+ * Create a tag. If message is NULL, creates a lightweight tag.
+ * If message is provided, creates an annotated tag.
+ *
+ * Lightweight: POST /repos/:o/:r/git/refs
+ *   {"ref":"refs/tags/<name>","sha":"<head_sha>"}
+ *
+ * Annotated: first POST /repos/:o/:r/git/tags to create tag object,
+ *   then POST /repos/:o/:r/git/refs to point ref at it.
+ */
+GitResult git_tag_create(r, name, message)
+GitRepo *r;
+char *name;
+char *message;
+{
+    GitResult result;
+    char *response;
+    char api_path[1024];
+    char *post_body;
+    int http_status;
+    char *val;
+    int len;
+    char tag_sha[GIT_MAX_SHA];
+
+    result.code = GIT_OK;
+    result.message[0] = '\0';
+    result.files_affected = 0;
+
+    if (!name || !name[0]) {
+        result.code = GIT_ERR_PARAM;
+        sprintf(result.message, "Tag name required");
+        return result;
+    }
+
+    if (!r->head_sha[0]) {
+        result.code = GIT_ERR_STATE;
+        sprintf(result.message, "No HEAD SHA available");
+        return result;
+    }
+
+    response = (char *)malloc(GIT_RESPONSE_BUF);
+    post_body = (char *)malloc(GIT_MAX_MSG + 512);
+    if (!response || !post_body) {
+        if (response) free(response);
+        if (post_body) free(post_body);
+        result.code = GIT_ERR_MEMORY;
+        sprintf(result.message, "Out of memory");
+        return result;
+    }
+
+    if (message && message[0]) {
+        /* Annotated tag: create tag object first */
+        char escaped_msg[GIT_MAX_MSG];
+        json_escape(message, escaped_msg, GIT_MAX_MSG);
+
+        sprintf(api_path, "/repos/%s/%s/git/tags",
+                r->owner, r->repo);
+        sprintf(post_body,
+            "{\"tag\":\"%s\",\"message\":\"%s\","
+            "\"object\":\"%s\",\"type\":\"commit\"}",
+            name, escaped_msg, r->head_sha);
+
+        http_status = gh_api_request(r->token, "POST", api_path,
+                                     post_body, response,
+                                     GIT_RESPONSE_BUF);
+
+        if (http_status != 201) {
+            free(response);
+            free(post_body);
+            result.code = (http_status == 422) ? GIT_ERR_CONFLICT :
+                          GIT_ERR_NETWORK;
+            sprintf(result.message,
+                "Failed to create tag object (HTTP %d)", http_status);
+            return result;
+        }
+
+        /* Extract tag object SHA */
+        val = json_find_string(response, "sha", &len);
+        if (val && len > 0 && len < GIT_MAX_SHA) {
+            strncpy(tag_sha, val, len);
+            tag_sha[len] = '\0';
+        } else {
+            free(response);
+            free(post_body);
+            result.code = GIT_ERR_NETWORK;
+            sprintf(result.message, "Could not parse tag object SHA");
+            return result;
+        }
+
+        /* Create ref pointing to tag object */
+        sprintf(api_path, "/repos/%s/%s/git/refs",
+                r->owner, r->repo);
+        sprintf(post_body,
+            "{\"ref\":\"refs/tags/%s\",\"sha\":\"%s\"}",
+            name, tag_sha);
+    } else {
+        /* Lightweight tag: just create the ref */
+        strcpy(tag_sha, r->head_sha);
+        sprintf(api_path, "/repos/%s/%s/git/refs",
+                r->owner, r->repo);
+        sprintf(post_body,
+            "{\"ref\":\"refs/tags/%s\",\"sha\":\"%s\"}",
+            name, r->head_sha);
+    }
+
+    http_status = gh_api_request(r->token, "POST", api_path,
+                                 post_body, response, GIT_RESPONSE_BUF);
+
+    free(response);
+    free(post_body);
+
+    if (http_status == 201) {
+        if (message && message[0]) {
+            sprintf(result.message,
+                "Created annotated tag '%s'", name);
+        } else {
+            sprintf(result.message,
+                "Created lightweight tag '%s'", name);
+        }
+    } else if (http_status == 422) {
+        result.code = GIT_ERR_CONFLICT;
+        sprintf(result.message, "Tag '%s' already exists", name);
+    } else {
+        result.code = GIT_ERR_NETWORK;
+        sprintf(result.message,
+            "Failed to create tag ref (HTTP %d)", http_status);
+    }
+
+    return result;
+}
+
 /* --- Compare operations --- */
 
 /*

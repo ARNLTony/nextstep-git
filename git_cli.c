@@ -19,6 +19,9 @@
  *        ./git branch -d <name>
  *        ./git checkout <branch>
  *        ./git merge <branch> [-m "message"]
+ *        ./git tag
+ *        ./git tag <name>
+ *        ./git tag -a <name> -m "message"
  *
  * (c) 2026 ARNLTony & Claude. MIT License.
  */
@@ -1208,6 +1211,120 @@ char *token;
     return 0;
 }
 
+/* --- Subcommand: tag --- */
+
+static int cmd_tag(argc, argv, token)
+int argc;
+char **argv;
+char *token;
+{
+    GitRepo repo;
+    GitFileList *fl;
+    GitResult res;
+    int i;
+    char *tag_name;
+    char *message;
+    int annotated;
+
+    fl = (GitFileList *)malloc(sizeof(GitFileList));
+    if (!fl) {
+        fprintf(stderr, "fatal: out of memory\n");
+        return 1;
+    }
+
+    memset(&repo, 0, sizeof(repo));
+    memset(fl, 0, sizeof(GitFileList));
+
+    if (find_repo(&repo, fl, token) < 0) {
+        free(fl);
+        return 1;
+    }
+
+    if (argc < 2) {
+        /* List tags: git tag */
+        GitTagList *tl;
+
+        tl = (GitTagList *)malloc(sizeof(GitTagList));
+        if (!tl) {
+            fprintf(stderr, "fatal: out of memory\n");
+            free(fl);
+            return 1;
+        }
+        memset(tl, 0, sizeof(GitTagList));
+
+        res = git_tag_list(&repo, tl);
+        if (res.code != GIT_OK) {
+            fprintf(stderr, "error: %s\n", res.message);
+            free(tl);
+            free(fl);
+            return 1;
+        }
+
+        if (tl->count == 0) {
+            printf("No tags found.\n");
+        } else {
+            for (i = 0; i < tl->count; i++) {
+                printf("  %s\n", tl->tags[i].name);
+            }
+        }
+
+        free(tl);
+        free(fl);
+        return 0;
+    }
+
+    /* Parse: git tag [-a] <name> [-m "message"] */
+    tag_name = NULL;
+    message = NULL;
+    annotated = 0;
+
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-a") == 0) {
+            annotated = 1;
+        } else if (strcmp(argv[i], "-m") == 0) {
+            if (i + 1 < argc) {
+                message = argv[i + 1];
+                i++;
+            } else {
+                fprintf(stderr,
+                    "error: switch 'm' requires a value\n");
+                free(fl);
+                return 1;
+            }
+        } else if (!tag_name) {
+            tag_name = argv[i];
+        }
+    }
+
+    if (!tag_name) {
+        fprintf(stderr,
+            "usage: %s tag <name>\n"
+            "   or: %s tag -a <name> -m \"message\"\n",
+            PROG_NAME, PROG_NAME);
+        free(fl);
+        return 1;
+    }
+
+    /* If -a flag used, require message */
+    if (annotated && !message) {
+        fprintf(stderr,
+            "error: annotated tag requires -m \"message\"\n");
+        free(fl);
+        return 1;
+    }
+
+    res = git_tag_create(&repo, tag_name, message);
+    if (res.code != GIT_OK) {
+        fprintf(stderr, "error: %s\n", res.message);
+        free(fl);
+        return 1;
+    }
+
+    printf("%s\n", res.message);
+    free(fl);
+    return 0;
+}
+
 /* --- Help --- */
 
 static void cmd_help()
@@ -1231,6 +1348,9 @@ static void cmd_help()
     printf("    branch -d <name>                   Delete branch\n");
     printf("    checkout <branch>                  Switch branch\n");
     printf("    merge <branch> [-m \"msg\"]           Merge branch\n");
+    printf("    tag                                List tags\n");
+    printf("    tag <name>                         Create lightweight tag\n");
+    printf("    tag -a <name> -m \"msg\"              Create annotated tag\n");
     printf("    help                               Show this help\n");
     printf("\n");
     printf("  Token: place your GitHub token in .github_token\n");
@@ -1311,6 +1431,9 @@ char **argv;
     }
     else if (strcmp(subcmd, "merge") == 0) {
         return cmd_merge(sub_argc, sub_argv, token);
+    }
+    else if (strcmp(subcmd, "tag") == 0) {
+        return cmd_tag(sub_argc, sub_argv, token);
     }
     else {
         fprintf(stderr, "'%s' is not a git command. See '%s help'.\n",

@@ -27,6 +27,7 @@
 #define GIT_MAX_BRANCHES     50
 #define GIT_MAX_COMPARE_FILES 50
 #define GIT_MAX_PATCH       4096
+#define GIT_MAX_TAGS         50
 #define GIT_STATE_FILE      ".nextstep_git"
 #define GIT_PENDING_FILE    ".nextstep_git_pending"
 
@@ -153,6 +154,18 @@ typedef struct GitCompareResult {
     int     file_count;
 } GitCompareResult;
 
+typedef struct GitTagEntry {
+    char    name[GIT_MAX_BRANCH];
+    char    sha[GIT_MAX_SHA];
+    char    message[GIT_MAX_MSG];
+    int     is_annotated;
+} GitTagEntry;
+
+typedef struct GitTagList {
+    GitTagEntry tags[GIT_MAX_TAGS];
+    int         count;
+} GitTagList;
+
 typedef struct GitMergeResult {
     int     code;
     char    message[GIT_MAX_ERRMSG];
@@ -208,6 +221,12 @@ GitResult git_branch_delete(GitRepo *r, char *name);
 /* --- Merge operations --- */
 
 GitMergeResult git_merge(GitRepo *r, char *head_branch, char *message);
+
+/* --- Tag operations --- */
+
+GitResult git_tag_list(GitRepo *r, GitTagList *out);
+
+GitResult git_tag_create(GitRepo *r, char *name, char *message);
 
 /* --- Compare operations --- */
 

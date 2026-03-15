@@ -28,6 +28,63 @@
 
 /* --- NeXTSTEP compatibility --- */
 
+/*
+ * snprintf shim for NeXTSTEP 3.3 (GCC 2.5.8 lacks snprintf).
+ * Uses vsprintf into a large temp buffer, then copies at most
+ * size-1 chars + NUL into dst. Returns the full formatted length.
+ *
+ * The temp buffer is 2048 bytes, which covers all our use cases
+ * (result.message is 512, api_path is 1024, pattern is 256).
+ */
+#include <stdarg.h>
+
+#define SNPRINTF_TMPBUF 2048
+
+int safe_snprintf(char *buf, int size, char *fmt, ...)
+{
+    va_list ap;
+    char tmp[SNPRINTF_TMPBUF];
+    int len;
+
+    if (size <= 0) return 0;
+
+    va_start(ap, fmt);
+    len = vsprintf(tmp, fmt, ap);
+    va_end(ap);
+
+    if (len < 0) {
+        buf[0] = '\0';
+        return 0;
+    }
+
+    if (len >= size) {
+        strncpy(buf, tmp, size - 1);
+        buf[size - 1] = '\0';
+    } else {
+        strcpy(buf, tmp);
+    }
+
+    return len;
+}
+
+/*
+ * Path safety check: reject paths containing ".." or starting with "/".
+ * Returns 1 if safe, 0 if unsafe (potential path traversal).
+ */
+static int path_is_safe(path)
+char *path;
+{
+    if (!path || !path[0]) return 0;
+
+    /* Reject absolute paths */
+    if (path[0] == '/') return 0;
+
+    /* Reject paths containing ".." component */
+    if (strstr(path, "..") != NULL) return 0;
+
+    return 1;
+}
+
 /* NeXTSTEP 3.3 lacks S_ISDIR/S_ISREG macros */
 #ifndef S_ISDIR
 #define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
@@ -85,7 +142,7 @@ int *out_len;
     char pattern[256];
     char *p, *start, *search;
 
-    sprintf(pattern, "\"%s\"", key);
+    safe_snprintf(pattern, sizeof(pattern), "\"%s\"", key);
     search = json;
 
     while (1) {
@@ -129,7 +186,7 @@ char *key;
     char *p, *search;
     long val;
 
-    sprintf(pattern, "\"%s\"", key);
+    safe_snprintf(pattern, sizeof(pattern), "\"%s\"", key);
     search = json;
 
     while (1) {
@@ -166,7 +223,7 @@ char *key;
     char pattern[256];
     char *p, *search;
 
-    sprintf(pattern, "\"%s\"", key);
+    safe_snprintf(pattern, sizeof(pattern), "\"%s\"", key);
     search = json;
 
     while (1) {
@@ -735,9 +792,10 @@ int count;
     struct stat st;
 
     if (relpath[0]) {
-        sprintf(fullpath, "%s/%s", basepath, relpath);
+        safe_snprintf(fullpath, sizeof(fullpath), "%s/%s", basepath, relpath);
     } else {
-        strcpy(fullpath, basepath);
+        strncpy(fullpath, basepath, sizeof(fullpath) - 1);
+        fullpath[sizeof(fullpath) - 1] = '\0';
     }
 
     dir = opendir(fullpath);
@@ -751,12 +809,13 @@ int count;
 
         /* build full path for stat */
         if (relpath[0]) {
-            sprintf(newrel, "%s/%s", relpath, entry->d_name);
+            safe_snprintf(newrel, sizeof(newrel), "%s/%s", relpath, entry->d_name);
         } else {
-            strcpy(newrel, entry->d_name);
+            strncpy(newrel, entry->d_name, sizeof(newrel) - 1);
+            newrel[sizeof(newrel) - 1] = '\0';
         }
 
-        sprintf(fullpath, "%s/%s", basepath, newrel);
+        safe_snprintf(fullpath, sizeof(fullpath), "%s/%s", basepath, newrel);
 
         if (stat(fullpath, &st) < 0) continue;
 
@@ -879,11 +938,11 @@ GitFileList *out;
 
     out->count = 0;
 
-    sprintf(statepath, "%s/%s", r->local_path, GIT_STATE_FILE);
+    safe_snprintf(statepath, sizeof(statepath), "%s/%s", r->local_path, GIT_STATE_FILE);
     data = git_read_file(statepath, &fsize);
     if (!data) {
         result.code = GIT_ERR_STATE;
-        sprintf(result.message, "No state file found (not a cloned repo?)");
+        safe_snprintf(result.message, sizeof(result.message), "No state file found (not a cloned repo?)");
         return result;
     }
 
@@ -974,7 +1033,7 @@ GitFileList *state;
     buf = (char *)malloc(bufsize);
     if (!buf) {
         result.code = GIT_ERR_MEMORY;
-        sprintf(result.message, "Out of memory saving state");
+        safe_snprintf(result.message, sizeof(result.message), "Out of memory saving state");
         return result;
     }
 
@@ -994,10 +1053,10 @@ GitFileList *state;
                        state->files[i].size);
     }
 
-    sprintf(statepath, "%s/%s", r->local_path, GIT_STATE_FILE);
+    safe_snprintf(statepath, sizeof(statepath), "%s/%s", r->local_path, GIT_STATE_FILE);
     if (git_write_file(statepath, buf, (long)pos) < 0) {
         result.code = GIT_ERR_DISK;
-        sprintf(result.message, "Failed to write state file");
+        safe_snprintf(result.message, sizeof(result.message), "Failed to write state file");
     }
 
     free(buf);
@@ -1030,11 +1089,11 @@ int message_size;
 
     if (message_out) message_out[0] = '\0';
 
-    sprintf(pendpath, "%s/%s", r->local_path, GIT_PENDING_FILE);
+    safe_snprintf(pendpath, sizeof(pendpath), "%s/%s", r->local_path, GIT_PENDING_FILE);
     data = git_read_file(pendpath, &fsize);
     if (!data) {
         result.code = GIT_ERR_STATE;
-        sprintf(result.message, "No pending commit");
+        safe_snprintf(result.message, sizeof(result.message), "No pending commit");
         return result;
     }
 
@@ -1067,10 +1126,10 @@ char *message;
     result.message[0] = '\0';
     result.files_affected = 0;
 
-    sprintf(pendpath, "%s/%s", r->local_path, GIT_PENDING_FILE);
+    safe_snprintf(pendpath, sizeof(pendpath), "%s/%s", r->local_path, GIT_PENDING_FILE);
     if (git_write_file(pendpath, message, (long)strlen(message)) < 0) {
         result.code = GIT_ERR_DISK;
-        sprintf(result.message, "Failed to write pending file");
+        safe_snprintf(result.message, sizeof(result.message), "Failed to write pending file");
     }
 
     return result;
@@ -1086,7 +1145,7 @@ GitRepo *r;
     result.message[0] = '\0';
     result.files_affected = 0;
 
-    sprintf(pendpath, "%s/%s", r->local_path, GIT_PENDING_FILE);
+    safe_snprintf(pendpath, sizeof(pendpath), "%s/%s", r->local_path, GIT_PENDING_FILE);
     unlink(pendpath);
 
     return result;
@@ -1112,7 +1171,7 @@ char *token;
 
     if (!owner || !repo || !local_path || !token) {
         result.code = GIT_ERR_PARAM;
-        sprintf(result.message, "Missing required parameters");
+        safe_snprintf(result.message, sizeof(result.message), "Missing required parameters");
         return result;
     }
 
@@ -1207,7 +1266,7 @@ int *out_len;
     response = (char *)malloc(GIT_RESPONSE_BUF);
     if (!response) return NULL;
 
-    sprintf(api_path, "/repos/%s/%s/contents/%s?ref=%s",
+    safe_snprintf(api_path, sizeof(api_path), "/repos/%s/%s/contents/%s?ref=%s",
             owner, repo, path, branch);
     http_status = gh_api_request(token, "GET", api_path, NULL,
                                  response, GIT_RESPONSE_BUF);
@@ -1244,7 +1303,7 @@ int *out_len;
     response = (char *)malloc(resp_size);
     if (!response) return NULL;
 
-    sprintf(api_path, "/repos/%s/%s/git/blobs/%s",
+    safe_snprintf(api_path, sizeof(api_path), "/repos/%s/%s/git/blobs/%s",
             owner, repo, blob_sha);
     http_status = gh_api_request(token, "GET", api_path, NULL,
                                  response, resp_size);
@@ -1310,7 +1369,7 @@ void *userdata;
         if (file_shas) free(file_shas);
         if (state) free(state);
         result.code = GIT_ERR_MEMORY;
-        sprintf(result.message, "Out of memory");
+        safe_snprintf(result.message, sizeof(result.message), "Out of memory");
         return result;
     }
 
@@ -1319,7 +1378,7 @@ void *userdata;
         if (git_mkdir_p(r->local_path) < 0) {
             free(file_paths); free(file_shas); free(state);
             result.code = GIT_ERR_DISK;
-            sprintf(result.message, "Cannot create directory: %s", r->local_path);
+            safe_snprintf(result.message, sizeof(result.message), "Cannot create directory: %s", r->local_path);
             return result;
         }
     }
@@ -1328,7 +1387,7 @@ void *userdata;
     if (!response) {
         free(file_paths); free(file_shas); free(state);
         result.code = GIT_ERR_MEMORY;
-        sprintf(result.message, "Out of memory");
+        safe_snprintf(result.message, sizeof(result.message), "Out of memory");
         return result;
     }
 
@@ -1337,13 +1396,13 @@ void *userdata;
                         0, 0, "Getting branch info...") < 0) {
         free(response); free(file_paths); free(file_shas); free(state);
         result.code = GIT_ERR_PARAM;
-        sprintf(result.message, "Cancelled");
+        safe_snprintf(result.message, sizeof(result.message), "Cancelled");
         return result;
     }
 
     if (r->branch[0] == '\0') {
         /* No branch specified — ask the repo API for the default */
-        sprintf(api_path, "/repos/%s/%s", r->owner, r->repo);
+        safe_snprintf(api_path, sizeof(api_path), "/repos/%s/%s", r->owner, r->repo);
         http_status = gh_api_request(r->token, "GET", api_path, NULL,
                                      response, GIT_RESPONSE_BUF);
         if (http_status >= 200 && http_status < 300) {
@@ -1358,7 +1417,7 @@ void *userdata;
         }
     }
 
-    sprintf(api_path, "/repos/%s/%s/git/refs/heads/%s",
+    safe_snprintf(api_path, sizeof(api_path), "/repos/%s/%s/git/refs/heads/%s",
             r->owner, r->repo, r->branch);
     http_status = gh_api_request(r->token, "GET", api_path, NULL,
                                  response, GIT_RESPONSE_BUF);
@@ -1368,7 +1427,7 @@ void *userdata;
         result.code = (http_status == 404) ? GIT_ERR_NOTFOUND :
                       (http_status == 401 || http_status == 403) ? GIT_ERR_AUTH :
                       GIT_ERR_NETWORK;
-        sprintf(result.message, "Failed to get branch ref (HTTP %d)", http_status);
+        safe_snprintf(result.message, sizeof(result.message), "Failed to get branch ref (HTTP %d)", http_status);
         return result;
     }
 
@@ -1377,7 +1436,7 @@ void *userdata;
     if (!val || len < 1) {
         free(response); free(file_paths); free(file_shas); free(state);
         result.code = GIT_ERR_NETWORK;
-        sprintf(result.message, "Could not parse branch ref");
+        safe_snprintf(result.message, sizeof(result.message), "Could not parse branch ref");
         return result;
     }
     if (len > GIT_MAX_SHA - 1) len = GIT_MAX_SHA - 1;
@@ -1388,7 +1447,7 @@ void *userdata;
     report_progress(progress_fn, userdata, GIT_PROGRESS_STATUS,
                     0, 0, "Getting file tree...");
 
-    sprintf(api_path, "/repos/%s/%s/git/trees/%s?recursive=1",
+    safe_snprintf(api_path, sizeof(api_path), "/repos/%s/%s/git/trees/%s?recursive=1",
             r->owner, r->repo, r->branch);
     http_status = gh_api_request(r->token, "GET", api_path, NULL,
                                  response, GIT_RESPONSE_BUF);
@@ -1396,7 +1455,7 @@ void *userdata;
     if (http_status < 200 || http_status >= 300) {
         free(response); free(file_paths); free(file_shas); free(state);
         result.code = GIT_ERR_NETWORK;
-        sprintf(result.message, "Failed to get file tree (HTTP %d)", http_status);
+        safe_snprintf(result.message, sizeof(result.message), "Failed to get file tree (HTTP %d)", http_status);
         return result;
     }
 
@@ -1418,7 +1477,7 @@ void *userdata;
         if (!tree_arr) {
             free(response); free(file_paths); free(file_shas); free(state);
             result.code = GIT_ERR_NETWORK;
-            sprintf(result.message, "No tree array in response");
+            safe_snprintf(result.message, sizeof(result.message), "No tree array in response");
             return result;
         }
 
@@ -1437,6 +1496,12 @@ void *userdata;
                     if (val && len > 0 && len < GIT_MAX_PATH) {
                         json_unescape(val, len, file_paths[file_count],
                                       GIT_MAX_PATH);
+
+                        /* Security: skip paths with traversal */
+                        if (!path_is_safe(file_paths[file_count])) {
+                            elem = json_array_next(elem, &end);
+                            continue;
+                        }
 
                         /* Get SHA */
                         val = json_find_string(elem, "sha", &len);
@@ -1467,7 +1532,7 @@ void *userdata;
 
         free(file_paths); free(file_shas); free(state);
         result.code = GIT_OK;
-        sprintf(result.message, "Cloned empty repository");
+        safe_snprintf(result.message, sizeof(result.message), "Cloned empty repository");
         return result;
     }
 
@@ -1481,14 +1546,14 @@ void *userdata;
         char *decoded;
         int decoded_len;
 
-        sprintf(progress_msg, "Downloading %s (%d/%d)",
+        safe_snprintf(progress_msg, sizeof(progress_msg), "Downloading %s (%d/%d)",
                 file_paths[i], i + 1, file_count);
 
         if (report_progress(progress_fn, userdata, GIT_PROGRESS_DOWNLOAD,
                             i + 1, file_count, progress_msg) < 0) {
             free(response); free(file_paths); free(file_shas); free(state);
             result.code = GIT_ERR_PARAM;
-            sprintf(result.message, "Cancelled at file %d/%d", i + 1, file_count);
+            safe_snprintf(result.message, sizeof(result.message), "Cancelled at file %d/%d", i + 1, file_count);
             return result;
         }
 
@@ -1499,7 +1564,7 @@ void *userdata;
         if (!decoded) continue;
 
         /* Create parent directories */
-        sprintf(filepath, "%s/%s", r->local_path, file_paths[i]);
+        safe_snprintf(filepath, sizeof(filepath), "%s/%s", r->local_path, file_paths[i]);
         path_dirname(filepath, dirpath, GIT_MAX_PATH);
         if (dirpath[0] && !git_is_directory(dirpath)) {
             git_mkdir_p(dirpath);
@@ -1538,7 +1603,7 @@ void *userdata;
     report_progress(progress_fn, userdata, GIT_PROGRESS_DONE,
                     file_count, file_count, "Clone complete");
 
-    sprintf(result.message, "Cloned %d files from %s/%s",
+    safe_snprintf(result.message, sizeof(result.message), "Cloned %d files from %s/%s",
             result.files_affected, r->owner, r->repo);
     return result;
 }
@@ -1571,7 +1636,7 @@ GitFileList *out;
         if (tracked) free(tracked);
         if (disk_paths) free(disk_paths);
         result.code = GIT_ERR_MEMORY;
-        sprintf(result.message, "Out of memory");
+        safe_snprintf(result.message, sizeof(result.message), "Out of memory");
         return result;
     }
 
@@ -1587,7 +1652,7 @@ GitFileList *out;
 
     /* Check each tracked file */
     for (i = 0; i < tracked->count && out->count < GIT_MAX_FILES; i++) {
-        sprintf(filepath, "%s/%s", r->local_path, tracked->files[i].path);
+        safe_snprintf(filepath, sizeof(filepath), "%s/%s", r->local_path, tracked->files[i].path);
 
         if (!git_is_file(filepath)) {
             /* File was deleted */
@@ -1658,7 +1723,7 @@ GitFileList *out;
                 out->files[out->count].sha[0] = '\0';
                 out->files[out->count].status = GIT_STATUS_NEW;
 
-                sprintf(filepath, "%s/%s", r->local_path, disk_paths[i]);
+                safe_snprintf(filepath, sizeof(filepath), "%s/%s", r->local_path, disk_paths[i]);
                 data = git_read_file(filepath, &fsize);
                 if (data) {
                     out->files[out->count].size = fsize;
@@ -1678,7 +1743,7 @@ GitFileList *out;
     free(tracked);
     free(disk_paths);
 
-    sprintf(result.message, "%d changed files", result.files_affected);
+    safe_snprintf(result.message, sizeof(result.message), "%d changed files", result.files_affected);
     return result;
 }
 
@@ -1702,12 +1767,12 @@ GitFileList *state;
 
     if (!path || !path[0]) {
         result.code = GIT_ERR_PARAM;
-        sprintf(result.message, "No file path specified");
+        safe_snprintf(result.message, sizeof(result.message), "No file path specified");
         return result;
     }
 
     /* Check file exists on disk */
-    sprintf(filepath, "%s/%s", r->local_path, path);
+    safe_snprintf(filepath, sizeof(filepath), "%s/%s", r->local_path, path);
     if (!git_is_file(filepath)) {
         /* Check if it's a tracked file that was deleted */
         found = 0;
@@ -1721,9 +1786,9 @@ GitFileList *state;
         }
         if (!found) {
             result.code = GIT_ERR_NOTFOUND;
-            sprintf(result.message, "File not found: %s", path);
+            safe_snprintf(result.message, sizeof(result.message), "File not found: %s", path);
         } else {
-            sprintf(result.message, "Staged deleted file: %s", path);
+            safe_snprintf(result.message, sizeof(result.message), "Staged deleted file: %s", path);
         }
         return result;
     }
@@ -1732,7 +1797,7 @@ GitFileList *state;
     data = git_read_file(filepath, &fsize);
     if (!data) {
         result.code = GIT_ERR_DISK;
-        sprintf(result.message, "Cannot read file: %s", path);
+        safe_snprintf(result.message, sizeof(result.message), "Cannot read file: %s", path);
         return result;
     }
     content_hash(data, fsize, hash);
@@ -1753,7 +1818,7 @@ GitFileList *state;
         /* New file, add to state */
         if (state->count >= GIT_MAX_FILES) {
             result.code = GIT_ERR_TOOLARGE;
-            sprintf(result.message, "Too many files tracked");
+            safe_snprintf(result.message, sizeof(result.message), "Too many files tracked");
             return result;
         }
         i = state->count;
@@ -1766,7 +1831,7 @@ GitFileList *state;
     }
 
     result.files_affected = 1;
-    sprintf(result.message, "Staged: %s", path);
+    safe_snprintf(result.message, sizeof(result.message), "Staged: %s", path);
 
     /* Save state */
     git_save_state(r, state);
@@ -1792,7 +1857,7 @@ GitFileList *state;
     status_list = (GitFileList *)malloc(sizeof(GitFileList));
     if (!status_list) {
         result.code = GIT_ERR_MEMORY;
-        sprintf(result.message, "Out of memory");
+        safe_snprintf(result.message, sizeof(result.message), "Out of memory");
         return result;
     }
 
@@ -1806,7 +1871,7 @@ GitFileList *state;
     if (status_list->count == 0) {
         free(status_list);
         result.code = GIT_ERR_NOCHANGES;
-        sprintf(result.message, "No changes to stage");
+        safe_snprintf(result.message, sizeof(result.message), "No changes to stage");
         return result;
     }
 
@@ -1819,7 +1884,7 @@ GitFileList *state;
     }
 
     free(status_list);
-    sprintf(result.message, "Staged %d files", result.files_affected);
+    safe_snprintf(result.message, sizeof(result.message), "Staged %d files", result.files_affected);
     return result;
 }
 
@@ -1845,7 +1910,7 @@ GitFileList *state;
 
     if (!message || !message[0]) {
         result.code = GIT_ERR_PARAM;
-        sprintf(result.message, "Commit message is required");
+        safe_snprintf(result.message, sizeof(result.message), "Commit message is required");
         return result;
     }
 
@@ -1859,7 +1924,7 @@ GitFileList *state;
 
     if (staged_count == 0) {
         result.code = GIT_ERR_NOCHANGES;
-        sprintf(result.message, "No files staged for commit");
+        safe_snprintf(result.message, sizeof(result.message), "No files staged for commit");
         return result;
     }
 
@@ -1868,7 +1933,7 @@ GitFileList *state;
     pending_buf = (char *)malloc(pending_buf_size);
     if (!pending_buf) {
         result.code = GIT_ERR_MEMORY;
-        sprintf(result.message, "Out of memory");
+        safe_snprintf(result.message, sizeof(result.message), "Out of memory");
         return result;
     }
 
@@ -1893,7 +1958,7 @@ GitFileList *state;
     if (result.code != GIT_OK) return result;
 
     result.files_affected = staged_count;
-    sprintf(result.message, "Committed %d files (pending push)", staged_count);
+    safe_snprintf(result.message, sizeof(result.message), "Committed %d files (pending push)", staged_count);
     return result;
 }
 
@@ -1954,17 +2019,17 @@ void *userdata;
         if (staged_paths) free(staged_paths);
         if (blob_shas) free(blob_shas);
         result.code = GIT_ERR_MEMORY;
-        sprintf(result.message, "Out of memory");
+        safe_snprintf(result.message, sizeof(result.message), "Out of memory");
         return result;
     }
 
     /* Load pending commit */
-    sprintf(pending_path, "%s/%s", r->local_path, GIT_PENDING_FILE);
+    safe_snprintf(pending_path, sizeof(pending_path), "%s/%s", r->local_path, GIT_PENDING_FILE);
     pending_data = git_read_file(pending_path, &pending_size);
     if (!pending_data) {
         free(staged_paths); free(blob_shas);
         result.code = GIT_ERR_STATE;
-        sprintf(result.message, "No pending commit to push (run commit first)");
+        safe_snprintf(result.message, sizeof(result.message), "No pending commit to push (run commit first)");
         return result;
     }
 
@@ -2015,7 +2080,7 @@ void *userdata;
     if (staged_count <= 0) {
         free(staged_paths); free(blob_shas);
         result.code = GIT_ERR_NOCHANGES;
-        sprintf(result.message, "No files in pending commit");
+        safe_snprintf(result.message, sizeof(result.message), "No files in pending commit");
         return result;
     }
 
@@ -2023,7 +2088,7 @@ void *userdata;
     if (!response) {
         free(staged_paths); free(blob_shas);
         result.code = GIT_ERR_MEMORY;
-        sprintf(result.message, "Out of memory");
+        safe_snprintf(result.message, sizeof(result.message), "Out of memory");
         return result;
     }
 
@@ -2036,18 +2101,18 @@ void *userdata;
         char progress_msg[GIT_MAX_ERRMSG];
         int is_deleted;
 
-        sprintf(progress_msg, "Uploading %s (%d/%d)",
+        safe_snprintf(progress_msg, sizeof(progress_msg), "Uploading %s (%d/%d)",
                 staged_paths[i], i + 1, staged_count);
         if (report_progress(progress_fn, userdata, GIT_PROGRESS_UPLOAD,
                             i + 1, staged_count, progress_msg) < 0) {
             free(response); free(staged_paths); free(blob_shas);
             result.code = GIT_ERR_PARAM;
-            sprintf(result.message, "Cancelled");
+            safe_snprintf(result.message, sizeof(result.message), "Cancelled");
             return result;
         }
 
         /* Check if file is deleted */
-        sprintf(filepath, "%s/%s", r->local_path, staged_paths[i]);
+        safe_snprintf(filepath, sizeof(filepath), "%s/%s", r->local_path, staged_paths[i]);
         is_deleted = !git_is_file(filepath);
 
         if (is_deleted) {
@@ -2061,7 +2126,7 @@ void *userdata;
         if (!file_data) {
             free(response); free(staged_paths); free(blob_shas);
             result.code = GIT_ERR_DISK;
-            sprintf(result.message, "Cannot read file: %s", staged_paths[i]);
+            safe_snprintf(result.message, sizeof(result.message), "Cannot read file: %s", staged_paths[i]);
             return result;
         }
 
@@ -2071,7 +2136,7 @@ void *userdata;
             free(file_data);
             free(response); free(staged_paths); free(blob_shas);
             result.code = GIT_ERR_MEMORY;
-            sprintf(result.message, "Out of memory encoding %s", staged_paths[i]);
+            safe_snprintf(result.message, sizeof(result.message), "Out of memory encoding %s", staged_paths[i]);
             return result;
         }
         b64_len = gh_base64_encode(file_data, (int)file_size, b64_data,
@@ -2086,21 +2151,21 @@ void *userdata;
             free(b64_data);
             free(response); free(staged_paths); free(blob_shas);
             result.code = GIT_ERR_MEMORY;
-            sprintf(result.message, "Out of memory");
+            safe_snprintf(result.message, sizeof(result.message), "Out of memory");
             return result;
         }
 
         sprintf(post_body, "{\"content\":\"%s\",\"encoding\":\"base64\"}", b64_data);
         free(b64_data);
 
-        sprintf(api_path, "/repos/%s/%s/git/blobs", r->owner, r->repo);
+        safe_snprintf(api_path, sizeof(api_path), "/repos/%s/%s/git/blobs", r->owner, r->repo);
         http_status = gh_api_request(r->token, "POST", api_path, post_body,
                                      response, GIT_RESPONSE_BUF);
         free(post_body);
 
         if (http_status < 200 || http_status >= 300) {
             result.code = GIT_ERR_NETWORK;
-            sprintf(result.message, "Blob fail %s (HTTP %d): %.200s",
+            safe_snprintf(result.message, sizeof(result.message), "Blob fail %s (HTTP %d): %.200s",
                     staged_paths[i], http_status, response);
             free(response); free(staged_paths); free(blob_shas);
             return result;
@@ -2111,7 +2176,7 @@ void *userdata;
         if (!val || len < 1) {
             free(response); free(staged_paths); free(blob_shas);
             result.code = GIT_ERR_NETWORK;
-            sprintf(result.message, "No SHA in blob response for %s",
+            safe_snprintf(result.message, sizeof(result.message), "No SHA in blob response for %s",
                     staged_paths[i]);
             return result;
         }
@@ -2135,7 +2200,7 @@ void *userdata;
         if (!post_body) {
             free(response); free(staged_paths); free(blob_shas);
             result.code = GIT_ERR_MEMORY;
-            sprintf(result.message, "Out of memory building tree");
+            safe_snprintf(result.message, sizeof(result.message), "Out of memory building tree");
             return result;
         }
 
@@ -2163,7 +2228,7 @@ void *userdata;
 
         pos += sprintf(post_body + pos, "]}");
 
-        sprintf(api_path, "/repos/%s/%s/git/trees", r->owner, r->repo);
+        safe_snprintf(api_path, sizeof(api_path), "/repos/%s/%s/git/trees", r->owner, r->repo);
         http_status = gh_api_request(r->token, "POST", api_path, post_body,
                                      response, GIT_RESPONSE_BUF);
         free(post_body);
@@ -2171,7 +2236,7 @@ void *userdata;
         if (http_status < 200 || http_status >= 300) {
             free(response); free(staged_paths); free(blob_shas);
             result.code = GIT_ERR_NETWORK;
-            sprintf(result.message, "Failed to create tree (HTTP %d)", http_status);
+            safe_snprintf(result.message, sizeof(result.message), "Failed to create tree (HTTP %d)", http_status);
             return result;
         }
 
@@ -2180,7 +2245,7 @@ void *userdata;
         if (!val || len < 1) {
             free(response); free(staged_paths); free(blob_shas);
             result.code = GIT_ERR_NETWORK;
-            sprintf(result.message, "No SHA in tree response");
+            safe_snprintf(result.message, sizeof(result.message), "No SHA in tree response");
             return result;
         }
         if (len > GIT_MAX_SHA - 1) len = GIT_MAX_SHA - 1;
@@ -2207,7 +2272,7 @@ void *userdata;
         if (!post_body) {
             free(response); free(staged_paths); free(blob_shas);
             result.code = GIT_ERR_MEMORY;
-            sprintf(result.message, "Out of memory creating commit");
+            safe_snprintf(result.message, sizeof(result.message), "Out of memory creating commit");
             return result;
         }
 
@@ -2219,7 +2284,7 @@ void *userdata;
             esc_msg, new_tree_sha, r->head_sha, esc_name, esc_email);
     }
 
-    sprintf(api_path, "/repos/%s/%s/git/commits", r->owner, r->repo);
+    safe_snprintf(api_path, sizeof(api_path), "/repos/%s/%s/git/commits", r->owner, r->repo);
     http_status = gh_api_request(r->token, "POST", api_path, post_body,
                                  response, GIT_RESPONSE_BUF);
     free(post_body);
@@ -2227,7 +2292,7 @@ void *userdata;
     if (http_status < 200 || http_status >= 300) {
         free(response); free(staged_paths); free(blob_shas);
         result.code = GIT_ERR_NETWORK;
-        sprintf(result.message, "Failed to create commit (HTTP %d)", http_status);
+        safe_snprintf(result.message, sizeof(result.message), "Failed to create commit (HTTP %d)", http_status);
         return result;
     }
 
@@ -2236,7 +2301,7 @@ void *userdata;
     if (!val || len < 1) {
         free(response); free(staged_paths); free(blob_shas);
         result.code = GIT_ERR_NETWORK;
-        sprintf(result.message, "No SHA in commit response");
+        safe_snprintf(result.message, sizeof(result.message), "No SHA in commit response");
         return result;
     }
     if (len > GIT_MAX_SHA - 1) len = GIT_MAX_SHA - 1;
@@ -2251,12 +2316,12 @@ void *userdata;
     if (!post_body) {
         free(response); free(staged_paths); free(blob_shas);
         result.code = GIT_ERR_MEMORY;
-        sprintf(result.message, "Out of memory");
+        safe_snprintf(result.message, sizeof(result.message), "Out of memory");
         return result;
     }
     sprintf(post_body, "{\"sha\":\"%s\"}", new_commit_sha);
 
-    sprintf(api_path, "/repos/%s/%s/git/refs/heads/%s",
+    safe_snprintf(api_path, sizeof(api_path), "/repos/%s/%s/git/refs/heads/%s",
             r->owner, r->repo, r->branch);
     http_status = gh_api_request(r->token, "PATCH", api_path, post_body,
                                  response, GIT_RESPONSE_BUF);
@@ -2265,7 +2330,7 @@ void *userdata;
     if (http_status < 200 || http_status >= 300) {
         free(response); free(staged_paths); free(blob_shas);
         result.code = GIT_ERR_NETWORK;
-        sprintf(result.message, "Failed to update ref (HTTP %d)", http_status);
+        safe_snprintf(result.message, sizeof(result.message), "Failed to update ref (HTTP %d)", http_status);
         return result;
     }
 
@@ -2284,7 +2349,7 @@ void *userdata;
                     if (state->files[j].status == GIT_STATUS_STAGED) {
                         /* Check if the file was deleted */
                         char fp[GIT_MAX_PATH];
-                        sprintf(fp, "%s/%s", r->local_path, staged_paths[i]);
+                        safe_snprintf(fp, sizeof(fp), "%s/%s", r->local_path, staged_paths[i]);
                         if (!git_is_file(fp)) {
                             /* Remove from state by shifting */
                             int k;
@@ -2315,7 +2380,7 @@ void *userdata;
                     staged_count, staged_count, "Push complete");
 
     result.files_affected = staged_count;
-    sprintf(result.message, "Pushed %d files to %s/%s:%s",
+    safe_snprintf(result.message, sizeof(result.message), "Pushed %d files to %s/%s:%s",
             staged_count, r->owner, r->repo, r->branch);
     return result;
 }
@@ -2348,7 +2413,7 @@ void *userdata;
     tracked = (GitFileList *)malloc(sizeof(GitFileList));
     if (!tracked) {
         result.code = GIT_ERR_MEMORY;
-        sprintf(result.message, "Out of memory");
+        safe_snprintf(result.message, sizeof(result.message), "Out of memory");
         return result;
     }
 
@@ -2363,7 +2428,7 @@ void *userdata;
     if (!response) {
         free(tracked);
         result.code = GIT_ERR_MEMORY;
-        sprintf(result.message, "Out of memory");
+        safe_snprintf(result.message, sizeof(result.message), "Out of memory");
         return result;
     }
 
@@ -2371,7 +2436,7 @@ void *userdata;
                     0, 0, "Checking for updates...");
 
     /* Get current remote HEAD */
-    sprintf(api_path, "/repos/%s/%s/git/refs/heads/%s",
+    safe_snprintf(api_path, sizeof(api_path), "/repos/%s/%s/git/refs/heads/%s",
             r->owner, r->repo, r->branch);
     http_status = gh_api_request(r->token, "GET", api_path, NULL,
                                  response, GIT_RESPONSE_BUF);
@@ -2379,7 +2444,7 @@ void *userdata;
     if (http_status < 200 || http_status >= 300) {
         free(response); free(tracked);
         result.code = GIT_ERR_NETWORK;
-        sprintf(result.message, "Failed to get branch ref (HTTP %d)", http_status);
+        safe_snprintf(result.message, sizeof(result.message), "Failed to get branch ref (HTTP %d)", http_status);
         return result;
     }
 
@@ -2387,7 +2452,7 @@ void *userdata;
     if (!val || len < 1) {
         free(response); free(tracked);
         result.code = GIT_ERR_NETWORK;
-        sprintf(result.message, "Could not parse branch ref");
+        safe_snprintf(result.message, sizeof(result.message), "Could not parse branch ref");
         return result;
     }
     if (len > GIT_MAX_SHA - 1) len = GIT_MAX_SHA - 1;
@@ -2397,7 +2462,7 @@ void *userdata;
     /* Check if already up to date */
     if (strcmp(remote_head, r->head_sha) == 0) {
         free(response); free(tracked);
-        sprintf(result.message, "Already up to date");
+        safe_snprintf(result.message, sizeof(result.message), "Already up to date");
         return result;
     }
 
@@ -2405,7 +2470,7 @@ void *userdata;
     report_progress(progress_fn, userdata, GIT_PROGRESS_STATUS,
                     0, 0, "Getting remote tree...");
 
-    sprintf(api_path, "/repos/%s/%s/git/trees/%s?recursive=1",
+    safe_snprintf(api_path, sizeof(api_path), "/repos/%s/%s/git/trees/%s?recursive=1",
             r->owner, r->repo, remote_head);
     http_status = gh_api_request(r->token, "GET", api_path, NULL,
                                  response, GIT_RESPONSE_BUF);
@@ -2413,7 +2478,7 @@ void *userdata;
     if (http_status < 200 || http_status >= 300) {
         free(response); free(tracked);
         result.code = GIT_ERR_NETWORK;
-        sprintf(result.message, "Failed to get remote tree (HTTP %d)", http_status);
+        safe_snprintf(result.message, sizeof(result.message), "Failed to get remote tree (HTTP %d)", http_status);
         return result;
     }
 
@@ -2438,7 +2503,7 @@ void *userdata;
         if (!tree_arr) {
             free(response); free(tracked);
             result.code = GIT_ERR_NETWORK;
-            sprintf(result.message, "No tree array in response");
+            safe_snprintf(result.message, sizeof(result.message), "No tree array in response");
             return result;
         }
 
@@ -2458,6 +2523,12 @@ void *userdata;
                 continue;
             }
             json_unescape(val, len, remote_path, GIT_MAX_PATH);
+
+            /* Security: skip paths with traversal */
+            if (!path_is_safe(remote_path)) {
+                elem = json_array_next(elem, &end);
+                continue;
+            }
 
             /* Get SHA */
             val = json_find_string(elem, "sha", &len);
@@ -2500,7 +2571,7 @@ void *userdata;
 
                 updated++;
 
-                sprintf(progress_msg, "Updating %s", remote_path);
+                safe_snprintf(progress_msg, sizeof(progress_msg), "Updating %s", remote_path);
                 report_progress(progress_fn, userdata, GIT_PROGRESS_DOWNLOAD,
                                 updated, 0, progress_msg);
 
@@ -2514,7 +2585,7 @@ void *userdata;
                 }
 
                 /* Create dirs and write file */
-                sprintf(filepath, "%s/%s", r->local_path, remote_path);
+                safe_snprintf(filepath, sizeof(filepath), "%s/%s", r->local_path, remote_path);
                 path_dirname(filepath, dirpath, GIT_MAX_PATH);
                 if (dirpath[0] && !git_is_directory(dirpath)) {
                     git_mkdir_p(dirpath);
@@ -2567,9 +2638,9 @@ void *userdata;
                     0, 0, "Pull complete");
 
     if (result.files_affected == 0) {
-        sprintf(result.message, "Already up to date (ref updated)");
+        safe_snprintf(result.message, sizeof(result.message), "Already up to date (ref updated)");
     } else {
-        sprintf(result.message, "Updated %d files from %s/%s:%s",
+        safe_snprintf(result.message, sizeof(result.message), "Updated %d files from %s/%s:%s",
                 result.files_affected, r->owner, r->repo, r->branch);
     }
     return result;
@@ -2601,11 +2672,11 @@ GitBranchList *out;
     response = (char *)malloc(GIT_RESPONSE_BUF);
     if (!response) {
         result.code = GIT_ERR_MEMORY;
-        sprintf(result.message, "Out of memory");
+        safe_snprintf(result.message, sizeof(result.message), "Out of memory");
         return result;
     }
 
-    sprintf(api_path, "/repos/%s/%s/branches?per_page=%d",
+    safe_snprintf(api_path, sizeof(api_path), "/repos/%s/%s/branches?per_page=%d",
             r->owner, r->repo, GIT_MAX_BRANCHES);
     http_status = gh_api_request(r->token, "GET", api_path, NULL,
                                  response, GIT_RESPONSE_BUF);
@@ -2615,7 +2686,7 @@ GitBranchList *out;
         result.code = (http_status == 404) ? GIT_ERR_NOTFOUND :
                       (http_status == 401 || http_status == 403) ? GIT_ERR_AUTH :
                       GIT_ERR_NETWORK;
-        sprintf(result.message, "Failed to list branches (HTTP %d)", http_status);
+        safe_snprintf(result.message, sizeof(result.message), "Failed to list branches (HTTP %d)", http_status);
         return result;
     }
 
@@ -2647,7 +2718,7 @@ GitBranchList *out;
     free(response);
 
     result.files_affected = out->count;
-    sprintf(result.message, "%d branches", out->count);
+    safe_snprintf(result.message, sizeof(result.message), "%d branches", out->count);
     return result;
 }
 
@@ -2674,26 +2745,26 @@ char *from_sha;
 
     if (!name || !name[0]) {
         result.code = GIT_ERR_PARAM;
-        sprintf(result.message, "Branch name required");
+        safe_snprintf(result.message, sizeof(result.message), "Branch name required");
         return result;
     }
 
     sha = (from_sha && from_sha[0]) ? from_sha : r->head_sha;
     if (!sha[0]) {
         result.code = GIT_ERR_STATE;
-        sprintf(result.message, "No HEAD SHA available");
+        safe_snprintf(result.message, sizeof(result.message), "No HEAD SHA available");
         return result;
     }
 
     response = (char *)malloc(GIT_RESPONSE_BUF);
     if (!response) {
         result.code = GIT_ERR_MEMORY;
-        sprintf(result.message, "Out of memory");
+        safe_snprintf(result.message, sizeof(result.message), "Out of memory");
         return result;
     }
 
-    sprintf(api_path, "/repos/%s/%s/git/refs", r->owner, r->repo);
-    sprintf(post_body, "{\"ref\":\"refs/heads/%s\",\"sha\":\"%s\"}", name, sha);
+    safe_snprintf(api_path, sizeof(api_path), "/repos/%s/%s/git/refs", r->owner, r->repo);
+    safe_snprintf(post_body, sizeof(post_body), "{\"ref\":\"refs/heads/%s\",\"sha\":\"%s\"}", name, sha);
 
     http_status = gh_api_request(r->token, "POST", api_path, post_body,
                                  response, GIT_RESPONSE_BUF);
@@ -2701,13 +2772,13 @@ char *from_sha;
     free(response);
 
     if (http_status == 201) {
-        sprintf(result.message, "Branch '%s' created", name);
+        safe_snprintf(result.message, sizeof(result.message), "Branch '%s' created", name);
     } else if (http_status == 422) {
         result.code = GIT_ERR_CONFLICT;
-        sprintf(result.message, "Branch '%s' already exists", name);
+        safe_snprintf(result.message, sizeof(result.message), "Branch '%s' already exists", name);
     } else {
         result.code = GIT_ERR_NETWORK;
-        sprintf(result.message, "Failed to create branch (HTTP %d)", http_status);
+        safe_snprintf(result.message, sizeof(result.message), "Failed to create branch (HTTP %d)", http_status);
     }
 
     return result;
@@ -2753,13 +2824,13 @@ void *userdata;
 
     if (!name || !name[0]) {
         result.code = GIT_ERR_PARAM;
-        sprintf(result.message, "Branch name required");
+        safe_snprintf(result.message, sizeof(result.message), "Branch name required");
         return result;
     }
 
     /* Already on this branch? */
     if (strcmp(r->branch, name) == 0) {
-        sprintf(result.message, "Already on branch '%s'", name);
+        safe_snprintf(result.message, sizeof(result.message), "Already on branch '%s'", name);
         return result;
     }
 
@@ -2767,7 +2838,7 @@ void *userdata;
     for (i = 0; i < fl->count; i++) {
         if (fl->files[i].status == GIT_STATUS_STAGED) {
             result.code = GIT_ERR_CONFLICT;
-            sprintf(result.message,
+            safe_snprintf(result.message, sizeof(result.message),
                 "Cannot switch branches: you have staged changes.\n"
                 "Commit or unstage them first.");
             return result;
@@ -2777,7 +2848,7 @@ void *userdata;
     response = (char *)malloc(GIT_RESPONSE_BUF);
     if (!response) {
         result.code = GIT_ERR_MEMORY;
-        sprintf(result.message, "Out of memory");
+        safe_snprintf(result.message, sizeof(result.message), "Out of memory");
         return result;
     }
 
@@ -2788,7 +2859,7 @@ void *userdata;
         if (remote_paths) free(remote_paths);
         if (remote_shas) free(remote_shas);
         result.code = GIT_ERR_MEMORY;
-        sprintf(result.message, "Out of memory");
+        safe_snprintf(result.message, sizeof(result.message), "Out of memory");
         return result;
     }
 
@@ -2796,7 +2867,7 @@ void *userdata;
     report_progress(progress_fn, userdata, GIT_PROGRESS_START,
                     0, 0, "Getting branch info...");
 
-    sprintf(api_path, "/repos/%s/%s/git/refs/heads/%s",
+    safe_snprintf(api_path, sizeof(api_path), "/repos/%s/%s/git/refs/heads/%s",
             r->owner, r->repo, name);
     http_status = gh_api_request(r->token, "GET", api_path, NULL,
                                  response, GIT_RESPONSE_BUF);
@@ -2804,7 +2875,7 @@ void *userdata;
     if (http_status < 200 || http_status >= 300) {
         free(response); free(remote_paths); free(remote_shas);
         result.code = (http_status == 404) ? GIT_ERR_NOTFOUND : GIT_ERR_NETWORK;
-        sprintf(result.message, "Branch '%s' not found (HTTP %d)", name, http_status);
+        safe_snprintf(result.message, sizeof(result.message), "Branch '%s' not found (HTTP %d)", name, http_status);
         return result;
     }
 
@@ -2812,7 +2883,7 @@ void *userdata;
     if (!val || len < 1) {
         free(response); free(remote_paths); free(remote_shas);
         result.code = GIT_ERR_NETWORK;
-        sprintf(result.message, "Could not parse branch ref");
+        safe_snprintf(result.message, sizeof(result.message), "Could not parse branch ref");
         return result;
     }
     if (len > GIT_MAX_SHA - 1) len = GIT_MAX_SHA - 1;
@@ -2823,7 +2894,7 @@ void *userdata;
     report_progress(progress_fn, userdata, GIT_PROGRESS_STATUS,
                     0, 0, "Getting file tree...");
 
-    sprintf(api_path, "/repos/%s/%s/git/trees/%s?recursive=1",
+    safe_snprintf(api_path, sizeof(api_path), "/repos/%s/%s/git/trees/%s?recursive=1",
             r->owner, r->repo, new_head);
     http_status = gh_api_request(r->token, "GET", api_path, NULL,
                                  response, GIT_RESPONSE_BUF);
@@ -2831,7 +2902,7 @@ void *userdata;
     if (http_status < 200 || http_status >= 300) {
         free(response); free(remote_paths); free(remote_shas);
         result.code = GIT_ERR_NETWORK;
-        sprintf(result.message, "Failed to get tree (HTTP %d)", http_status);
+        safe_snprintf(result.message, sizeof(result.message), "Failed to get tree (HTTP %d)", http_status);
         return result;
     }
 
@@ -2853,7 +2924,7 @@ void *userdata;
         if (!tree_arr) {
             free(response); free(remote_paths); free(remote_shas);
             result.code = GIT_ERR_NETWORK;
-            sprintf(result.message, "No tree array in response");
+            safe_snprintf(result.message, sizeof(result.message), "No tree array in response");
             return result;
         }
 
@@ -2870,6 +2941,12 @@ void *userdata;
                     if (val && len > 0 && len < GIT_MAX_PATH) {
                         json_unescape(val, len, remote_paths[remote_count],
                                       GIT_MAX_PATH);
+
+                        /* Security: skip paths with traversal */
+                        if (!path_is_safe(remote_paths[remote_count])) {
+                            elem = json_array_next(elem, &end);
+                            continue;
+                        }
 
                         val = json_find_string(elem, "sha", &len);
                         if (val && len > 0 && len < GIT_MAX_SHA) {
@@ -2932,7 +3009,7 @@ void *userdata;
             int decoded_len;
 
             updated++;
-            sprintf(progress_msg, "%s (%d/%d)",
+            safe_snprintf(progress_msg, sizeof(progress_msg), "%s (%d/%d)",
                     remote_paths[i], updated, remote_count);
             report_progress(progress_fn, userdata, GIT_PROGRESS_DOWNLOAD,
                             updated, remote_count, progress_msg);
@@ -2942,7 +3019,7 @@ void *userdata;
                                         remote_shas[i], &decoded_len);
             if (!decoded) continue;
 
-            sprintf(filepath, "%s/%s", r->local_path, remote_paths[i]);
+            safe_snprintf(filepath, sizeof(filepath), "%s/%s", r->local_path, remote_paths[i]);
             path_dirname(filepath, dirpath, GIT_MAX_PATH);
             if (dirpath[0] && !git_is_directory(dirpath)) {
                 git_mkdir_p(dirpath);
@@ -2988,7 +3065,7 @@ void *userdata;
 
         if (!in_remote) {
             char filepath[GIT_MAX_PATH];
-            sprintf(filepath, "%s/%s", r->local_path, fl->files[j].path);
+            safe_snprintf(filepath, sizeof(filepath), "%s/%s", r->local_path, fl->files[j].path);
             unlink(filepath);
 
             /* Remove from file list by shifting */
@@ -3013,7 +3090,7 @@ void *userdata;
     report_progress(progress_fn, userdata, GIT_PROGRESS_DONE,
                     0, 0, "Branch switch complete");
 
-    sprintf(result.message, "Switched to branch '%s' (%d files updated)",
+    safe_snprintf(result.message, sizeof(result.message), "Switched to branch '%s' (%d files updated)",
             name, result.files_affected);
     return result;
 }
@@ -3037,25 +3114,25 @@ char *name;
 
     if (!name || !name[0]) {
         result.code = GIT_ERR_PARAM;
-        sprintf(result.message, "Branch name required");
+        safe_snprintf(result.message, sizeof(result.message), "Branch name required");
         return result;
     }
 
     /* Refuse to delete current branch */
     if (strcmp(r->branch, name) == 0) {
         result.code = GIT_ERR_PARAM;
-        sprintf(result.message, "Cannot delete the current branch '%s'", name);
+        safe_snprintf(result.message, sizeof(result.message), "Cannot delete the current branch '%s'", name);
         return result;
     }
 
     response = (char *)malloc(GIT_RESPONSE_BUF);
     if (!response) {
         result.code = GIT_ERR_MEMORY;
-        sprintf(result.message, "Out of memory");
+        safe_snprintf(result.message, sizeof(result.message), "Out of memory");
         return result;
     }
 
-    sprintf(api_path, "/repos/%s/%s/git/refs/heads/%s",
+    safe_snprintf(api_path, sizeof(api_path), "/repos/%s/%s/git/refs/heads/%s",
             r->owner, r->repo, name);
     http_status = gh_api_request(r->token, "DELETE", api_path, NULL,
                                  response, GIT_RESPONSE_BUF);
@@ -3063,17 +3140,17 @@ char *name;
     free(response);
 
     if (http_status == 204) {
-        sprintf(result.message, "Deleted branch '%s'", name);
+        safe_snprintf(result.message, sizeof(result.message), "Deleted branch '%s'", name);
     } else if (http_status == 404) {
         result.code = GIT_ERR_NOTFOUND;
-        sprintf(result.message, "Branch '%s' not found", name);
+        safe_snprintf(result.message, sizeof(result.message), "Branch '%s' not found", name);
     } else if (http_status == 422) {
         result.code = GIT_ERR_PARAM;
-        sprintf(result.message,
+        safe_snprintf(result.message, sizeof(result.message),
             "Cannot delete branch '%s' (may be protected)", name);
     } else {
         result.code = GIT_ERR_NETWORK;
-        sprintf(result.message, "Failed to delete branch (HTTP %d)", http_status);
+        safe_snprintf(result.message, sizeof(result.message), "Failed to delete branch (HTTP %d)", http_status);
     }
 
     return result;
@@ -3108,14 +3185,14 @@ char *message;
 
     if (!head_branch || !head_branch[0]) {
         result.code = GIT_ERR_PARAM;
-        sprintf(result.message, "Branch name required");
+        safe_snprintf(result.message, sizeof(result.message), "Branch name required");
         return result;
     }
 
     /* Can't merge a branch into itself */
     if (strcmp(r->branch, head_branch) == 0) {
         result.code = GIT_ERR_PARAM;
-        sprintf(result.message,
+        safe_snprintf(result.message, sizeof(result.message),
             "Cannot merge '%s' into itself", head_branch);
         return result;
     }
@@ -3123,7 +3200,7 @@ char *message;
     response = (char *)malloc(GIT_RESPONSE_BUF);
     if (!response) {
         result.code = GIT_ERR_MEMORY;
-        sprintf(result.message, "Out of memory");
+        safe_snprintf(result.message, sizeof(result.message), "Out of memory");
         return result;
     }
 
@@ -3132,7 +3209,7 @@ char *message;
     if (!post_body) {
         free(response);
         result.code = GIT_ERR_MEMORY;
-        sprintf(result.message, "Out of memory");
+        safe_snprintf(result.message, sizeof(result.message), "Out of memory");
         return result;
     }
 
@@ -3148,7 +3225,7 @@ char *message;
             r->branch, head_branch);
     }
 
-    sprintf(api_path, "/repos/%s/%s/merges", r->owner, r->repo);
+    safe_snprintf(api_path, sizeof(api_path), "/repos/%s/%s/merges", r->owner, r->repo);
     http_status = gh_api_request(r->token, "POST", api_path, post_body,
                                  response, GIT_RESPONSE_BUF);
 
@@ -3161,27 +3238,27 @@ char *message;
             strncpy(result.sha, val, len);
             result.sha[len] = '\0';
         }
-        sprintf(result.message,
+        safe_snprintf(result.message, sizeof(result.message),
             "Merged '%s' into '%s'", head_branch, r->branch);
     } else if (http_status == 204) {
         /* Already up to date — no merge needed */
-        sprintf(result.message,
+        safe_snprintf(result.message, sizeof(result.message),
             "Already up to date: '%s' is already merged into '%s'",
             head_branch, r->branch);
     } else if (http_status == 409) {
         /* Merge conflict */
         result.code = GIT_ERR_CONFLICT;
         result.conflicts = 1;
-        sprintf(result.message,
+        safe_snprintf(result.message, sizeof(result.message),
             "Merge conflict: cannot merge '%s' into '%s' automatically",
             head_branch, r->branch);
     } else if (http_status == 404) {
         result.code = GIT_ERR_NOTFOUND;
-        sprintf(result.message,
+        safe_snprintf(result.message, sizeof(result.message),
             "Branch '%s' not found", head_branch);
     } else {
         result.code = GIT_ERR_NETWORK;
-        sprintf(result.message,
+        safe_snprintf(result.message, sizeof(result.message),
             "Merge failed (HTTP %d)", http_status);
     }
 
@@ -3214,11 +3291,11 @@ GitTagList *out;
     response = (char *)malloc(GIT_RESPONSE_BUF);
     if (!response) {
         result.code = GIT_ERR_MEMORY;
-        sprintf(result.message, "Out of memory");
+        safe_snprintf(result.message, sizeof(result.message), "Out of memory");
         return result;
     }
 
-    sprintf(api_path, "/repos/%s/%s/tags?per_page=%d",
+    safe_snprintf(api_path, sizeof(api_path), "/repos/%s/%s/tags?per_page=%d",
             r->owner, r->repo, GIT_MAX_TAGS);
     http_status = gh_api_request(r->token, "GET", api_path, NULL,
                                  response, GIT_RESPONSE_BUF);
@@ -3227,7 +3304,7 @@ GitTagList *out;
         free(response);
         result.code = (http_status == 404) ? GIT_ERR_NOTFOUND :
                       GIT_ERR_NETWORK;
-        sprintf(result.message, "Failed to list tags (HTTP %d)",
+        safe_snprintf(result.message, sizeof(result.message), "Failed to list tags (HTTP %d)",
                 http_status);
         return result;
     }
@@ -3259,7 +3336,7 @@ GitTagList *out;
     free(response);
 
     result.files_affected = out->count;
-    sprintf(result.message, "%d tags", out->count);
+    safe_snprintf(result.message, sizeof(result.message), "%d tags", out->count);
     return result;
 }
 
@@ -3293,13 +3370,13 @@ char *message;
 
     if (!name || !name[0]) {
         result.code = GIT_ERR_PARAM;
-        sprintf(result.message, "Tag name required");
+        safe_snprintf(result.message, sizeof(result.message), "Tag name required");
         return result;
     }
 
     if (!r->head_sha[0]) {
         result.code = GIT_ERR_STATE;
-        sprintf(result.message, "No HEAD SHA available");
+        safe_snprintf(result.message, sizeof(result.message), "No HEAD SHA available");
         return result;
     }
 
@@ -3309,7 +3386,7 @@ char *message;
         if (response) free(response);
         if (post_body) free(post_body);
         result.code = GIT_ERR_MEMORY;
-        sprintf(result.message, "Out of memory");
+        safe_snprintf(result.message, sizeof(result.message), "Out of memory");
         return result;
     }
 
@@ -3318,7 +3395,7 @@ char *message;
         char escaped_msg[GIT_MAX_MSG];
         json_escape(message, escaped_msg, GIT_MAX_MSG);
 
-        sprintf(api_path, "/repos/%s/%s/git/tags",
+        safe_snprintf(api_path, sizeof(api_path), "/repos/%s/%s/git/tags",
                 r->owner, r->repo);
         sprintf(post_body,
             "{\"tag\":\"%s\",\"message\":\"%s\","
@@ -3334,7 +3411,7 @@ char *message;
             free(post_body);
             result.code = (http_status == 422) ? GIT_ERR_CONFLICT :
                           GIT_ERR_NETWORK;
-            sprintf(result.message,
+            safe_snprintf(result.message, sizeof(result.message),
                 "Failed to create tag object (HTTP %d)", http_status);
             return result;
         }
@@ -3348,12 +3425,12 @@ char *message;
             free(response);
             free(post_body);
             result.code = GIT_ERR_NETWORK;
-            sprintf(result.message, "Could not parse tag object SHA");
+            safe_snprintf(result.message, sizeof(result.message), "Could not parse tag object SHA");
             return result;
         }
 
         /* Create ref pointing to tag object */
-        sprintf(api_path, "/repos/%s/%s/git/refs",
+        safe_snprintf(api_path, sizeof(api_path), "/repos/%s/%s/git/refs",
                 r->owner, r->repo);
         sprintf(post_body,
             "{\"ref\":\"refs/tags/%s\",\"sha\":\"%s\"}",
@@ -3361,7 +3438,7 @@ char *message;
     } else {
         /* Lightweight tag: just create the ref */
         strcpy(tag_sha, r->head_sha);
-        sprintf(api_path, "/repos/%s/%s/git/refs",
+        safe_snprintf(api_path, sizeof(api_path), "/repos/%s/%s/git/refs",
                 r->owner, r->repo);
         sprintf(post_body,
             "{\"ref\":\"refs/tags/%s\",\"sha\":\"%s\"}",
@@ -3376,18 +3453,18 @@ char *message;
 
     if (http_status == 201) {
         if (message && message[0]) {
-            sprintf(result.message,
+            safe_snprintf(result.message, sizeof(result.message),
                 "Created annotated tag '%s'", name);
         } else {
-            sprintf(result.message,
+            safe_snprintf(result.message, sizeof(result.message),
                 "Created lightweight tag '%s'", name);
         }
     } else if (http_status == 422) {
         result.code = GIT_ERR_CONFLICT;
-        sprintf(result.message, "Tag '%s' already exists", name);
+        safe_snprintf(result.message, sizeof(result.message), "Tag '%s' already exists", name);
     } else {
         result.code = GIT_ERR_NETWORK;
-        sprintf(result.message,
+        safe_snprintf(result.message, sizeof(result.message),
             "Failed to create tag ref (HTTP %d)", http_status);
     }
 
@@ -3419,11 +3496,11 @@ GitReleaseList *out;
     response = (char *)malloc(GIT_RESPONSE_BUF);
     if (!response) {
         result.code = GIT_ERR_MEMORY;
-        sprintf(result.message, "Out of memory");
+        safe_snprintf(result.message, sizeof(result.message), "Out of memory");
         return result;
     }
 
-    sprintf(api_path, "/repos/%s/%s/releases?per_page=%d",
+    safe_snprintf(api_path, sizeof(api_path), "/repos/%s/%s/releases?per_page=%d",
             r->owner, r->repo, GIT_MAX_RELEASES);
     http_status = gh_api_request(r->token, "GET", api_path, NULL,
                                  response, GIT_RESPONSE_BUF);
@@ -3432,7 +3509,7 @@ GitReleaseList *out;
         free(response);
         result.code = (http_status == 404) ? GIT_ERR_NOTFOUND :
                       GIT_ERR_NETWORK;
-        sprintf(result.message, "Failed to list releases (HTTP %d)",
+        safe_snprintf(result.message, sizeof(result.message), "Failed to list releases (HTTP %d)",
                 http_status);
         return result;
     }
@@ -3478,7 +3555,7 @@ GitReleaseList *out;
     free(response);
 
     result.files_affected = out->count;
-    sprintf(result.message, "%d releases", out->count);
+    safe_snprintf(result.message, sizeof(result.message), "%d releases", out->count);
     return result;
 }
 
@@ -3504,7 +3581,7 @@ char *body;
 
     if (!tag || !tag[0]) {
         result.code = GIT_ERR_PARAM;
-        sprintf(result.message, "Tag name required");
+        safe_snprintf(result.message, sizeof(result.message), "Tag name required");
         return result;
     }
 
@@ -3514,7 +3591,7 @@ char *body;
         if (response) free(response);
         if (post_body) free(post_body);
         result.code = GIT_ERR_MEMORY;
-        sprintf(result.message, "Out of memory");
+        safe_snprintf(result.message, sizeof(result.message), "Out of memory");
         return result;
     }
 
@@ -3540,7 +3617,7 @@ char *body;
             tag, escaped_title, escaped_body);
     }
 
-    sprintf(api_path, "/repos/%s/%s/releases", r->owner, r->repo);
+    safe_snprintf(api_path, sizeof(api_path), "/repos/%s/%s/releases", r->owner, r->repo);
     http_status = gh_api_request(r->token, "POST", api_path,
                                  post_body, response, GIT_RESPONSE_BUF);
 
@@ -3548,20 +3625,20 @@ char *body;
     free(post_body);
 
     if (http_status == 201) {
-        sprintf(result.message,
+        safe_snprintf(result.message, sizeof(result.message),
             "Created release '%s' for tag '%s'",
             title ? title : tag, tag);
     } else if (http_status == 422) {
         result.code = GIT_ERR_CONFLICT;
-        sprintf(result.message,
+        safe_snprintf(result.message, sizeof(result.message),
             "Release for tag '%s' already exists", tag);
     } else if (http_status == 404) {
         result.code = GIT_ERR_NOTFOUND;
-        sprintf(result.message,
+        safe_snprintf(result.message, sizeof(result.message),
             "Tag '%s' not found (create it first)", tag);
     } else {
         result.code = GIT_ERR_NETWORK;
-        sprintf(result.message,
+        safe_snprintf(result.message, sizeof(result.message),
             "Failed to create release (HTTP %d)", http_status);
     }
 
@@ -3591,11 +3668,11 @@ GitRepo *r;
     response = (char *)malloc(GIT_RESPONSE_BUF);
     if (!response) {
         result.code = GIT_ERR_MEMORY;
-        sprintf(result.message, "Out of memory");
+        safe_snprintf(result.message, sizeof(result.message), "Out of memory");
         return result;
     }
 
-    sprintf(api_path, "/repos/%s/%s/forks", r->owner, r->repo);
+    safe_snprintf(api_path, sizeof(api_path), "/repos/%s/%s/forks", r->owner, r->repo);
     http_status = gh_api_request(r->token, "POST", api_path, "{}",
                                  response, GIT_RESPONSE_BUF);
 
@@ -3605,24 +3682,24 @@ GitRepo *r;
             char fork_name[GIT_MAX_ERRMSG];
             strncpy(fork_name, val, len);
             fork_name[len] = '\0';
-            sprintf(result.message, "Forked to %s", fork_name);
+            safe_snprintf(result.message, sizeof(result.message), "Forked to %s", fork_name);
         } else {
-            sprintf(result.message,
+            safe_snprintf(result.message, sizeof(result.message),
                 "Forked %s/%s (creation in progress)",
                 r->owner, r->repo);
         }
     } else if (http_status == 403) {
         result.code = GIT_ERR_AUTH;
-        sprintf(result.message,
+        safe_snprintf(result.message, sizeof(result.message),
             "Permission denied: cannot fork %s/%s",
             r->owner, r->repo);
     } else if (http_status == 404) {
         result.code = GIT_ERR_NOTFOUND;
-        sprintf(result.message,
+        safe_snprintf(result.message, sizeof(result.message),
             "Repository %s/%s not found", r->owner, r->repo);
     } else {
         result.code = GIT_ERR_NETWORK;
-        sprintf(result.message,
+        safe_snprintf(result.message, sizeof(result.message),
             "Fork failed (HTTP %d)", http_status);
     }
 
@@ -3657,7 +3734,14 @@ GitFileList *fl;
 
     if (!path || !path[0]) {
         result.code = GIT_ERR_PARAM;
-        sprintf(result.message, "File path required");
+        safe_snprintf(result.message, sizeof(result.message), "File path required");
+        return result;
+    }
+
+    /* Security: reject paths with traversal components */
+    if (!path_is_safe(path)) {
+        result.code = GIT_ERR_PARAM;
+        safe_snprintf(result.message, sizeof(result.message), "Invalid path (contains '..' or is absolute)");
         return result;
     }
 
@@ -3672,7 +3756,7 @@ GitFileList *fl;
 
     if (found < 0) {
         result.code = GIT_ERR_NOTFOUND;
-        sprintf(result.message, "File '%s' not tracked", path);
+        safe_snprintf(result.message, sizeof(result.message), "File '%s' not tracked", path);
         return result;
     }
 
@@ -3681,11 +3765,11 @@ GitFileList *fl;
     response = (char *)malloc(GIT_RESPONSE_BUF);
     if (!response) {
         result.code = GIT_ERR_MEMORY;
-        sprintf(result.message, "Out of memory");
+        safe_snprintf(result.message, sizeof(result.message), "Out of memory");
         return result;
     }
 
-    sprintf(api_path, "/repos/%s/%s/contents/%s?ref=%s",
+    safe_snprintf(api_path, sizeof(api_path), "/repos/%s/%s/contents/%s?ref=%s",
             r->owner, r->repo, path, r->branch);
     http_status = gh_api_request(r->token, "GET", api_path, NULL,
                                  response, GIT_RESPONSE_BUF);
@@ -3693,7 +3777,7 @@ GitFileList *fl;
     if (http_status < 200 || http_status >= 300) {
         free(response);
         result.code = GIT_ERR_NOTFOUND;
-        sprintf(result.message,
+        safe_snprintf(result.message, sizeof(result.message),
             "File '%s' not found on remote (HTTP %d)",
             path, http_status);
         return result;
@@ -3703,7 +3787,7 @@ GitFileList *fl;
     if (!val || len < 1 || len >= GIT_MAX_SHA) {
         free(response);
         result.code = GIT_ERR_NETWORK;
-        sprintf(result.message, "Could not get file SHA");
+        safe_snprintf(result.message, sizeof(result.message), "Could not get file SHA");
         return result;
     }
     strncpy(file_sha, val, len);
@@ -3714,14 +3798,14 @@ GitFileList *fl;
         char escaped_path[GIT_MAX_PATH];
         char escaped_msg[256];
         json_escape(path, escaped_path, GIT_MAX_PATH);
-        sprintf(escaped_msg, "Delete %s", path);
+        safe_snprintf(escaped_msg, sizeof(escaped_msg), "Delete %s", path);
 
-        sprintf(post_body,
+        safe_snprintf(post_body, sizeof(post_body),
             "{\"message\":\"%s\",\"sha\":\"%s\",\"branch\":\"%s\"}",
             escaped_msg, file_sha, r->branch);
     }
 
-    sprintf(api_path, "/repos/%s/%s/contents/%s",
+    safe_snprintf(api_path, sizeof(api_path), "/repos/%s/%s/contents/%s",
             r->owner, r->repo, path);
     http_status = gh_api_request(r->token, "DELETE", api_path,
                                  post_body, response, GIT_RESPONSE_BUF);
@@ -3732,7 +3816,7 @@ GitFileList *fl;
         /* Remove local file */
         {
             char filepath[GIT_MAX_PATH];
-            sprintf(filepath, "%s/%s", r->local_path, path);
+            safe_snprintf(filepath, sizeof(filepath), "%s/%s", r->local_path, path);
             unlink(filepath);
         }
 
@@ -3746,17 +3830,17 @@ GitFileList *fl;
         git_save_state(r, fl);
 
         result.files_affected = 1;
-        sprintf(result.message, "Deleted '%s'", path);
+        safe_snprintf(result.message, sizeof(result.message), "Deleted '%s'", path);
     } else if (http_status == 404) {
         result.code = GIT_ERR_NOTFOUND;
-        sprintf(result.message, "File '%s' not found on remote", path);
+        safe_snprintf(result.message, sizeof(result.message), "File '%s' not found on remote", path);
     } else if (http_status == 409) {
         result.code = GIT_ERR_CONFLICT;
-        sprintf(result.message,
+        safe_snprintf(result.message, sizeof(result.message),
             "Conflict deleting '%s' (SHA mismatch)", path);
     } else {
         result.code = GIT_ERR_NETWORK;
-        sprintf(result.message,
+        safe_snprintf(result.message, sizeof(result.message),
             "Failed to delete file (HTTP %d)", http_status);
     }
 
@@ -3785,11 +3869,11 @@ GitIgnoreList *out;
     result.files_affected = 0;
     out->count = 0;
 
-    sprintf(filepath, "%s/.gitignore", r->local_path);
+    safe_snprintf(filepath, sizeof(filepath), "%s/.gitignore", r->local_path);
     data = git_read_file(filepath, &fsize);
     if (!data) {
         /* No .gitignore is fine — just means nothing ignored */
-        sprintf(result.message, "No .gitignore found");
+        safe_snprintf(result.message, sizeof(result.message), "No .gitignore found");
         return result;
     }
 
@@ -3856,7 +3940,7 @@ GitIgnoreList *out;
     free(data);
 
     result.files_affected = out->count;
-    sprintf(result.message, "Loaded %d ignore patterns", out->count);
+    safe_snprintf(result.message, sizeof(result.message), "Loaded %d ignore patterns", out->count);
     return result;
 }
 
@@ -3929,8 +4013,8 @@ char *path;
 
             /* Also check if any component matches */
             {
-                char search[GIT_MAX_IGNORE_PATTERN + 2];
-                sprintf(search, "/%s/", pat);
+                char search[GIT_MAX_IGNORE_PATTERN + 4];
+                safe_snprintf(search, sizeof(search), "/%s/", pat);
                 if (strstr(path, search))
                     is_match = 1;
             }
@@ -3987,18 +4071,18 @@ GitCompareResult *out;
 
     if (!base || !base[0] || !head || !head[0]) {
         result.code = GIT_ERR_PARAM;
-        sprintf(result.message, "Both base and head are required");
+        safe_snprintf(result.message, sizeof(result.message), "Both base and head are required");
         return result;
     }
 
     response = (char *)malloc(GIT_RESPONSE_BUF);
     if (!response) {
         result.code = GIT_ERR_MEMORY;
-        sprintf(result.message, "Out of memory");
+        safe_snprintf(result.message, sizeof(result.message), "Out of memory");
         return result;
     }
 
-    sprintf(api_path, "/repos/%s/%s/compare/%s...%s",
+    safe_snprintf(api_path, sizeof(api_path), "/repos/%s/%s/compare/%s...%s",
             r->owner, r->repo, base, head);
     http_status = gh_api_request(r->token, "GET", api_path, NULL,
                                  response, GIT_RESPONSE_BUF);
@@ -4007,7 +4091,7 @@ GitCompareResult *out;
         free(response);
         result.code = (http_status == 404) ? GIT_ERR_NOTFOUND :
                       GIT_ERR_NETWORK;
-        sprintf(result.message,
+        safe_snprintf(result.message, sizeof(result.message),
             "Compare failed (HTTP %d)", http_status);
         return result;
     }
@@ -4032,7 +4116,7 @@ GitCompareResult *out;
     if (!files_arr) {
         /* No files section — possibly identical */
         free(response);
-        sprintf(result.message, "%s: %d commit(s), 0 files",
+        safe_snprintf(result.message, sizeof(result.message), "%s: %d commit(s), 0 files",
                 out->status, out->total_commits);
         return result;
     }
@@ -4051,7 +4135,7 @@ GitCompareResult *out;
 
         if (count == 0) {
             free(response);
-            sprintf(result.message, "%s: %d commit(s), 0 files",
+            safe_snprintf(result.message, sizeof(result.message), "%s: %d commit(s), 0 files",
                     out->status, out->total_commits);
             return result;
         }
@@ -4061,7 +4145,7 @@ GitCompareResult *out;
         if (!out->files) {
             free(response);
             result.code = GIT_ERR_MEMORY;
-            sprintf(result.message, "Out of memory");
+            safe_snprintf(result.message, sizeof(result.message), "Out of memory");
             return result;
         }
         memset(out->files, 0, count * sizeof(GitCompareFile));
@@ -4119,7 +4203,7 @@ GitCompareResult *out;
     free(response);
 
     result.files_affected = out->file_count;
-    sprintf(result.message, "%s: %d commit(s), %d file(s) changed",
+    safe_snprintf(result.message, sizeof(result.message), "%s: %d commit(s), %d file(s) changed",
             out->status, out->total_commits, out->file_count);
     return result;
 }
@@ -4172,11 +4256,11 @@ GitCommitLog *out;
     response = (char *)malloc(GIT_RESPONSE_BUF);
     if (!response) {
         result.code = GIT_ERR_MEMORY;
-        sprintf(result.message, "Out of memory");
+        safe_snprintf(result.message, sizeof(result.message), "Out of memory");
         return result;
     }
 
-    sprintf(api_path, "/repos/%s/%s/commits?sha=%s&per_page=%d",
+    safe_snprintf(api_path, sizeof(api_path), "/repos/%s/%s/commits?sha=%s&per_page=%d",
             r->owner, r->repo, r->branch, max_count);
     http_status = gh_api_request(r->token, "GET", api_path, NULL,
                                  response, GIT_RESPONSE_BUF);
@@ -4184,7 +4268,7 @@ GitCommitLog *out;
     if (http_status < 200 || http_status >= 300) {
         free(response);
         result.code = GIT_ERR_NETWORK;
-        sprintf(result.message, "Failed to get commits (HTTP %d)", http_status);
+        safe_snprintf(result.message, sizeof(result.message), "Failed to get commits (HTTP %d)", http_status);
         return result;
     }
 
@@ -4258,7 +4342,7 @@ GitCommitLog *out;
     free(response);
 
     result.files_affected = count;
-    sprintf(result.message, "%d commits", count);
+    safe_snprintf(result.message, sizeof(result.message), "%d commits", count);
     return result;
 }
 
@@ -4287,7 +4371,7 @@ void *userdata;
     status_list = (GitFileList *)malloc(sizeof(GitFileList));
     if (!status_list) {
         result.code = GIT_ERR_MEMORY;
-        sprintf(result.message, "Out of memory");
+        safe_snprintf(result.message, sizeof(result.message), "Out of memory");
         return result;
     }
 
@@ -4300,7 +4384,7 @@ void *userdata;
 
     if (status_list->count == 0) {
         free(status_list);
-        sprintf(result.message, "No changes");
+        safe_snprintf(result.message, sizeof(result.message), "No changes");
         return result;
     }
 
@@ -4321,7 +4405,7 @@ void *userdata;
         if (diff_count == 0) {
             free(status_list);
             result.code = GIT_ERR_NOTFOUND;
-            sprintf(result.message, "File not found in changes: %s", path);
+            safe_snprintf(result.message, sizeof(result.message), "File not found in changes: %s", path);
             return result;
         }
         status_list->count = 1;
@@ -4333,7 +4417,7 @@ void *userdata;
     if (!out->entries) {
         free(status_list);
         result.code = GIT_ERR_MEMORY;
-        sprintf(result.message, "Out of memory");
+        safe_snprintf(result.message, sizeof(result.message), "Out of memory");
         return result;
     }
 
@@ -4343,7 +4427,7 @@ void *userdata;
         out->entries = NULL;
         free(status_list);
         result.code = GIT_ERR_MEMORY;
-        sprintf(result.message, "Out of memory");
+        safe_snprintf(result.message, sizeof(result.message), "Out of memory");
         return result;
     }
 
@@ -4361,7 +4445,7 @@ void *userdata;
         de->status = status_list->files[i].status;
 
         /* Read local file */
-        sprintf(filepath, "%s/%s", r->local_path, status_list->files[i].path);
+        safe_snprintf(filepath, sizeof(filepath), "%s/%s", r->local_path, status_list->files[i].path);
         if (git_is_file(filepath)) {
             local_data = git_read_file(filepath, &local_size);
             if (local_data) {
@@ -4378,7 +4462,7 @@ void *userdata;
             char *val;
             int len;
 
-            sprintf(api_path, "/repos/%s/%s/contents/%s?ref=%s",
+            safe_snprintf(api_path, sizeof(api_path), "/repos/%s/%s/contents/%s?ref=%s",
                     r->owner, r->repo, status_list->files[i].path, r->branch);
 
             report_progress(progress_fn, userdata, GIT_PROGRESS_DOWNLOAD,
@@ -4418,7 +4502,7 @@ void *userdata;
 
     out->count = diff_count;
     result.files_affected = diff_count;
-    sprintf(result.message, "%d files differ", diff_count);
+    safe_snprintf(result.message, sizeof(result.message), "%d files differ", diff_count);
     return result;
 }
 

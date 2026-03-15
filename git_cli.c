@@ -67,14 +67,14 @@ int buf_size;
     if (!fp) {
         home = getenv("HOME");
         if (home) {
-            sprintf(path, "%s/%s", home, TOKEN_FILE);
+            safe_snprintf(path, sizeof(path), "%s/%s", home, TOKEN_FILE);
             fp = fopen(path, "r");
         }
     }
 
     /* Try /me/.github_token */
     if (!fp) {
-        sprintf(path, "/me/%s", TOKEN_FILE);
+        safe_snprintf(path, sizeof(path), "/me/%s", TOKEN_FILE);
         fp = fopen(path, "r");
     }
 
@@ -118,7 +118,7 @@ char *token;
     /* Check if .nextstep_git exists in cwd */
     {
         char state_path[GIT_MAX_PATH];
-        sprintf(state_path, "%s/%s", cwd, GIT_STATE_FILE);
+        safe_snprintf(state_path, sizeof(state_path), "%s/%s", cwd, GIT_STATE_FILE);
         if (!git_is_file(state_path)) {
             fprintf(stderr,
                 "fatal: not a git repository (no %s found)\n",
@@ -255,7 +255,7 @@ char *token;
         fprintf(stderr, "fatal: cannot determine current directory\n");
         return 1;
     }
-    sprintf(local_path, "%s/%s", cwd, reponame);
+    safe_snprintf(local_path, sizeof(local_path), "%s/%s", cwd, reponame);
 
     /* Parse optional branch and directory */
     argi = 2;
@@ -273,7 +273,7 @@ char *token;
                 strncpy(local_path, argv[argi], GIT_MAX_PATH - 1);
                 local_path[GIT_MAX_PATH - 1] = '\0';
             } else {
-                sprintf(local_path, "%s/%s", cwd, argv[argi]);
+                safe_snprintf(local_path, sizeof(local_path), "%s/%s", cwd, argv[argi]);
             }
         } else {
             /* One more arg: could be branch name or directory.
@@ -285,7 +285,7 @@ char *token;
                     strncpy(local_path, argv[argi], GIT_MAX_PATH - 1);
                     local_path[GIT_MAX_PATH - 1] = '\0';
                 } else {
-                    sprintf(local_path, "%s/%s", cwd, argv[argi]);
+                    safe_snprintf(local_path, sizeof(local_path), "%s/%s", cwd, argv[argi]);
                 }
             } else {
                 /* Treat as branch name */
@@ -545,7 +545,7 @@ char *token;
         strncpy(author_email, user, sizeof(author_email) - 1);
         author_email[sizeof(author_email) - 1] = '\0';
     } else {
-        sprintf(author_email, "%s@nextstep.local", author_name);
+        safe_snprintf(author_email, sizeof(author_email), "%s@nextstep.local", author_name);
     }
 
     res = git_commit(&repo, message, author_name, author_email, fl);

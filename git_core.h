@@ -290,6 +290,10 @@ GitResult git_clear_pending(GitRepo *r);
 
 void git_diff_free(GitDiffResult *diff);
 
+/* --- Safe string formatting (snprintf shim for NeXTSTEP 3.3) --- */
+
+int safe_snprintf(char *buf, int size, char *fmt, ...);
+
 /* --- File utilities --- */
 
 char *git_read_file(char *filepath, long *size_out);

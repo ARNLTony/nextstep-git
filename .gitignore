@@ -4,6 +4,7 @@ cryanc.h
 
 # Compiled binary
 git
+git-nextstep
 
 # Token file
 .github_token

@@ -17,6 +17,7 @@
  *        ./git branch <name>
  *        ./git branch -d <name>
  *        ./git checkout <branch>
+ *        ./git merge <branch> [-m "message"]
  *
  * (c) 2026 ARNLTony & Claude. MIT License.
  */
@@ -1035,6 +1036,97 @@ char *token;
     return 0;
 }
 
+/* --- Subcommand: merge --- */
+
+static int cmd_merge(argc, argv, token)
+int argc;
+char **argv;
+char *token;
+{
+    GitRepo repo;
+    GitFileList *fl;
+    GitMergeResult mres;
+    GitResult res;
+    char *branch_name;
+    char *message;
+    int i;
+
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s merge <branch> [-m \"message\"]\n",
+                PROG_NAME);
+        return 1;
+    }
+
+    branch_name = argv[1];
+
+    /* Parse optional -m "message" */
+    message = NULL;
+    for (i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "-m") == 0) {
+            if (i + 1 < argc) {
+                message = argv[i + 1];
+                break;
+            } else {
+                fprintf(stderr, "error: switch 'm' requires a value\n");
+                return 1;
+            }
+        }
+    }
+
+    fl = (GitFileList *)malloc(sizeof(GitFileList));
+    if (!fl) {
+        fprintf(stderr, "fatal: out of memory\n");
+        return 1;
+    }
+
+    memset(&repo, 0, sizeof(repo));
+    memset(fl, 0, sizeof(GitFileList));
+
+    if (find_repo(&repo, fl, token) < 0) {
+        free(fl);
+        return 1;
+    }
+
+    printf("Merging '%s' into '%s'...\n", branch_name, repo.branch);
+
+    mres = git_merge(&repo, branch_name, message);
+
+    if (mres.code == GIT_ERR_CONFLICT) {
+        fprintf(stderr, "error: %s\n", mres.message);
+        fprintf(stderr,
+            "Resolve conflicts on GitHub, then run '%s pull'.\n",
+            PROG_NAME);
+        free(fl);
+        return 1;
+    }
+
+    if (mres.code != GIT_OK) {
+        fprintf(stderr, "error: %s\n", mres.message);
+        free(fl);
+        return 1;
+    }
+
+    printf("%s\n", mres.message);
+
+    /* If merge created a new commit, pull to sync local files */
+    if (mres.sha[0]) {
+        printf("Pulling merged changes...\n");
+        res = git_pull(&repo, cli_progress, NULL);
+        if (res.code != GIT_OK) {
+            fprintf(stderr, "warning: pull after merge failed: %s\n",
+                    res.message);
+            fprintf(stderr, "Run '%s pull' manually to sync.\n",
+                    PROG_NAME);
+        } else {
+            printf("Pull complete. %d files updated.\n",
+                   res.files_affected);
+        }
+    }
+
+    free(fl);
+    return 0;
+}
+
 /* --- Help --- */
 
 static void cmd_help()
@@ -1056,6 +1148,7 @@ static void cmd_help()
     printf("    branch <name>                      Create branch\n");
     printf("    branch -d <name>                   Delete branch\n");
     printf("    checkout <branch>                  Switch branch\n");
+    printf("    merge <branch> [-m \"msg\"]           Merge branch\n");
     printf("    help                               Show this help\n");
     printf("\n");
     printf("  Token: place your GitHub token in .github_token\n");
@@ -1133,6 +1226,9 @@ char **argv;
     }
     else if (strcmp(subcmd, "checkout") == 0) {
         return cmd_checkout(sub_argc, sub_argv, token);
+    }
+    else if (strcmp(subcmd, "merge") == 0) {
+        return cmd_merge(sub_argc, sub_argv, token);
     }
     else {
         fprintf(stderr, "'%s' is not a git command. See '%s help'.\n",

@@ -134,6 +134,13 @@ typedef struct GitBranchList {
     int            count;
 } GitBranchList;
 
+typedef struct GitMergeResult {
+    int     code;
+    char    message[GIT_MAX_ERRMSG];
+    char    sha[GIT_MAX_SHA];
+    int     conflicts;
+} GitMergeResult;
+
 typedef struct GitResult {
     int     code;
     char    message[GIT_MAX_ERRMSG];
@@ -178,6 +185,10 @@ GitResult git_branch_switch(GitRepo *r, char *name, GitFileList *fl,
                             GitProgressFn progress_fn, void *userdata);
 
 GitResult git_branch_delete(GitRepo *r, char *name);
+
+/* --- Merge operations --- */
+
+GitMergeResult git_merge(GitRepo *r, char *head_branch, char *message);
 
 /* --- State persistence --- */
 

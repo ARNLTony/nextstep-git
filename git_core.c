@@ -3062,6 +3062,116 @@ char *name;
     return result;
 }
 
+/* --- Merge operations --- */
+
+/*
+ * Server-side merge via POST /repos/:o/:r/merges.
+ * Merges head_branch into the current branch (r->branch).
+ * HTTP 201 = success, 204 = already up to date, 409 = conflict.
+ * If message is NULL, GitHub generates a default merge commit message.
+ */
+GitMergeResult git_merge(r, head_branch, message)
+GitRepo *r;
+char *head_branch;
+char *message;
+{
+    GitMergeResult result;
+    char *response;
+    char api_path[1024];
+    char *post_body;
+    int post_len;
+    int http_status;
+    char *val;
+    int len;
+
+    result.code = GIT_OK;
+    result.message[0] = '\0';
+    result.sha[0] = '\0';
+    result.conflicts = 0;
+
+    if (!head_branch || !head_branch[0]) {
+        result.code = GIT_ERR_PARAM;
+        sprintf(result.message, "Branch name required");
+        return result;
+    }
+
+    /* Can't merge a branch into itself */
+    if (strcmp(r->branch, head_branch) == 0) {
+        result.code = GIT_ERR_PARAM;
+        sprintf(result.message,
+            "Cannot merge '%s' into itself", head_branch);
+        return result;
+    }
+
+    response = (char *)malloc(GIT_RESPONSE_BUF);
+    if (!response) {
+        result.code = GIT_ERR_MEMORY;
+        sprintf(result.message, "Out of memory");
+        return result;
+    }
+
+    /* Build POST body */
+    post_body = (char *)malloc(GIT_MAX_MSG + 256);
+    if (!post_body) {
+        free(response);
+        result.code = GIT_ERR_MEMORY;
+        sprintf(result.message, "Out of memory");
+        return result;
+    }
+
+    if (message && message[0]) {
+        char escaped_msg[GIT_MAX_MSG];
+        json_escape(message, escaped_msg, GIT_MAX_MSG);
+        sprintf(post_body,
+            "{\"base\":\"%s\",\"head\":\"%s\",\"commit_message\":\"%s\"}",
+            r->branch, head_branch, escaped_msg);
+    } else {
+        sprintf(post_body,
+            "{\"base\":\"%s\",\"head\":\"%s\"}",
+            r->branch, head_branch);
+    }
+
+    sprintf(api_path, "/repos/%s/%s/merges", r->owner, r->repo);
+    http_status = gh_api_request(r->token, "POST", api_path, post_body,
+                                 response, GIT_RESPONSE_BUF);
+
+    free(post_body);
+
+    if (http_status == 201) {
+        /* Merge successful — extract new commit SHA */
+        val = json_find_string(response, "sha", &len);
+        if (val && len > 0 && len < GIT_MAX_SHA) {
+            strncpy(result.sha, val, len);
+            result.sha[len] = '\0';
+        }
+        sprintf(result.message,
+            "Merged '%s' into '%s'", head_branch, r->branch);
+    } else if (http_status == 204) {
+        /* Already up to date — no merge needed */
+        sprintf(result.message,
+            "Already up to date: '%s' is already merged into '%s'",
+            head_branch, r->branch);
+    } else if (http_status == 409) {
+        /* Merge conflict */
+        result.code = GIT_ERR_CONFLICT;
+        result.conflicts = 1;
+        sprintf(result.message,
+            "Merge conflict: cannot merge '%s' into '%s' automatically",
+            head_branch, r->branch);
+    } else if (http_status == 404) {
+        result.code = GIT_ERR_NOTFOUND;
+        sprintf(result.message,
+            "Branch '%s' not found", head_branch);
+    } else {
+        result.code = GIT_ERR_NETWORK;
+        sprintf(result.message,
+            "Merge failed (HTTP %d)", http_status);
+    }
+
+    free(response);
+    return result;
+}
+
 /* --- git_log --- */
 
 GitResult git_log(r, max_count, out)

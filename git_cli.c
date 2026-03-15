@@ -24,6 +24,8 @@
  *        ./git tag -a <name> -m "message"
  *        ./git release list
  *        ./git release create <tag> [-t "title"] [-m "body"]
+ *        ./git fork
+ *        ./git rm <file>
  *
  * (c) 2026 ARNLTony & Claude. MIT License.
  */
@@ -1437,6 +1439,87 @@ char *token;
     return 0;
 }
 
+/* --- Subcommand: fork --- */
+
+static int cmd_fork(argc, argv, token)
+int argc;
+char **argv;
+char *token;
+{
+    GitRepo repo;
+    GitFileList *fl;
+    GitResult res;
+
+    fl = (GitFileList *)malloc(sizeof(GitFileList));
+    if (!fl) {
+        fprintf(stderr, "fatal: out of memory\n");
+        return 1;
+    }
+
+    memset(&repo, 0, sizeof(repo));
+    memset(fl, 0, sizeof(GitFileList));
+
+    if (find_repo(&repo, fl, token) < 0) {
+        free(fl);
+        return 1;
+    }
+
+    printf("Forking %s/%s...\n", repo.owner, repo.repo);
+
+    res = git_fork(&repo);
+    if (res.code != GIT_OK) {
+        fprintf(stderr, "error: %s\n", res.message);
+        free(fl);
+        return 1;
+    }
+
+    printf("%s\n", res.message);
+    free(fl);
+    return 0;
+}
+
+/* --- Subcommand: rm --- */
+
+static int cmd_rm(argc, argv, token)
+int argc;
+char **argv;
+char *token;
+{
+    GitRepo repo;
+    GitFileList *fl;
+    GitResult res;
+
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s rm <file>\n", PROG_NAME);
+        return 1;
+    }
+
+    fl = (GitFileList *)malloc(sizeof(GitFileList));
+    if (!fl) {
+        fprintf(stderr, "fatal: out of memory\n");
+        return 1;
+    }
+
+    memset(&repo, 0, sizeof(repo));
+    memset(fl, 0, sizeof(GitFileList));
+
+    if (find_repo(&repo, fl, token) < 0) {
+        free(fl);
+        return 1;
+    }
+
+    res = git_rm(&repo, argv[1], fl);
+    if (res.code != GIT_OK) {
+        fprintf(stderr, "error: %s\n", res.message);
+        free(fl);
+        return 1;
+    }
+
+    printf("%s\n", res.message);
+    free(fl);
+    return 0;
+}
+
 /* --- Help --- */
 
 static void cmd_help()
@@ -1465,6 +1548,8 @@ static void cmd_help()
     printf("    tag -a <name> -m \"msg\"              Create annotated tag\n");
     printf("    release list                       List releases\n");
     printf("    release create <tag> [-t -m]       Create release\n");
+    printf("    fork                               Fork repository\n");
+    printf("    rm <file>                          Delete file\n");
     printf("    help                               Show this help\n");
     printf("\n");
     printf("  Token: place your GitHub token in .github_token\n");
@@ -1551,6 +1636,12 @@ char **argv;
     }
     else if (strcmp(subcmd, "release") == 0) {
         return cmd_release(sub_argc, sub_argv, token);
+    }
+    else if (strcmp(subcmd, "fork") == 0) {
+        return cmd_fork(sub_argc, sub_argv, token);
+    }
+    else if (strcmp(subcmd, "rm") == 0) {
+        return cmd_rm(sub_argc, sub_argv, token);
     }
     else {
         fprintf(stderr, "'%s' is not a git command. See '%s help'.\n",

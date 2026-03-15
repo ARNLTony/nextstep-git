@@ -29,6 +29,8 @@
 #define GIT_MAX_PATCH       4096
 #define GIT_MAX_TAGS         50
 #define GIT_MAX_RELEASES     20
+#define GIT_MAX_IGNORE_PATTERNS  100
+#define GIT_MAX_IGNORE_PATTERN   128
 #define GIT_STATE_FILE      ".nextstep_git"
 #define GIT_PENDING_FILE    ".nextstep_git_pending"
 
@@ -188,6 +190,13 @@ typedef struct GitMergeResult {
     int     conflicts;
 } GitMergeResult;
 
+typedef struct GitIgnoreList {
+    char    patterns[GIT_MAX_IGNORE_PATTERNS][GIT_MAX_IGNORE_PATTERN];
+    int     negated[GIT_MAX_IGNORE_PATTERNS];
+    int     dir_only[GIT_MAX_IGNORE_PATTERNS];
+    int     count;
+} GitIgnoreList;
+
 typedef struct GitResult {
     int     code;
     char    message[GIT_MAX_ERRMSG];
@@ -249,6 +258,19 @@ GitResult git_release_list(GitRepo *r, GitReleaseList *out);
 
 GitResult git_release_create(GitRepo *r, char *tag, char *title,
                              char *body);
+
+/* --- Fork operations --- */
+
+GitResult git_fork(GitRepo *r);
+
+/* --- File delete operations --- */
+
+GitResult git_rm(GitRepo *r, char *path, GitFileList *fl);
+
+/* --- Gitignore operations --- */
+
+GitResult git_ignore_load(GitRepo *r, GitIgnoreList *out);
+int git_ignore_match(GitIgnoreList *ignore, char *path);
 
 /* --- Compare operations --- */
 

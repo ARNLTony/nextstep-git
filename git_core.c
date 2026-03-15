@@ -1628,34 +1628,51 @@ GitFileList *out;
         }
     }
 
-    /* Check for new (untracked) files on disk */
-    for (i = 0; i < disk_count && out->count < GIT_MAX_FILES; i++) {
-        found = 0;
-        for (j = 0; j < tracked->count; j++) {
-            if (strcmp(disk_paths[i], tracked->files[j].path) == 0) {
-                found = 1;
-                break;
+    /* Load .gitignore patterns */
+    {
+        GitIgnoreList *ignores;
+
+        ignores = (GitIgnoreList *)malloc(sizeof(GitIgnoreList));
+        if (ignores) {
+            memset(ignores, 0, sizeof(GitIgnoreList));
+            git_ignore_load(r, ignores);
+        }
+
+        /* Check for new (untracked) files on disk */
+        for (i = 0; i < disk_count && out->count < GIT_MAX_FILES; i++) {
+            found = 0;
+            for (j = 0; j < tracked->count; j++) {
+                if (strcmp(disk_paths[i], tracked->files[j].path) == 0) {
+                    found = 1;
+                    break;
+                }
+            }
+
+            if (!found) {
+                /* Skip ignored files */
+                if (ignores && git_ignore_match(ignores, disk_paths[i]))
+                    continue;
+
+                strncpy(out->files[out->count].path, disk_paths[i],
+                        GIT_MAX_PATH - 1);
+                out->files[out->count].sha[0] = '\0';
+                out->files[out->count].status = GIT_STATUS_NEW;
+
+                sprintf(filepath, "%s/%s", r->local_path, disk_paths[i]);
+                data = git_read_file(filepath, &fsize);
+                if (data) {
+                    out->files[out->count].size = fsize;
+                    free(data);
+                } else {
+                    out->files[out->count].size = 0;
+                }
+
+                out->count++;
+                result.files_affected++;
             }
         }
 
-        if (!found) {
-            strncpy(out->files[out->count].path, disk_paths[i],
-                    GIT_MAX_PATH - 1);
-            out->files[out->count].sha[0] = '\0';
-            out->files[out->count].status = GIT_STATUS_NEW;
-
-            sprintf(filepath, "%s/%s", r->local_path, disk_paths[i]);
-            data = git_read_file(filepath, &fsize);
-            if (data) {
-                out->files[out->count].size = fsize;
-                free(data);
-            } else {
-                out->files[out->count].size = 0;
-            }
-
-            out->count++;
-            result.files_affected++;
-        }
+        if (ignores) free(ignores);
     }
 
     free(tracked);
@@ -3549,6 +3566,390 @@ char *body;
     }
 
     return result;
+}
+
+/* --- Fork operations --- */
+
+/*
+ * Fork the current repo to the authenticated user's account.
+ * POST /repos/:o/:r/forks. Returns HTTP 202 (async creation).
+ */
+GitResult git_fork(r)
+GitRepo *r;
+{
+    GitResult result;
+    char *response;
+    char api_path[1024];
+    int http_status;
+    char *val;
+    int len;
+
+    result.code = GIT_OK;
+    result.message[0] = '\0';
+    result.files_affected = 0;
+
+    response = (char *)malloc(GIT_RESPONSE_BUF);
+    if (!response) {
+        result.code = GIT_ERR_MEMORY;
+        sprintf(result.message, "Out of memory");
+        return result;
+    }
+
+    sprintf(api_path, "/repos/%s/%s/forks", r->owner, r->repo);
+    http_status = gh_api_request(r->token, "POST", api_path, "{}",
+                                 response, GIT_RESPONSE_BUF);
+
+    if (http_status == 202) {
+        val = json_find_string(response, "full_name", &len);
+        if (val && len > 0 && len < GIT_MAX_ERRMSG - 20) {
+            char fork_name[GIT_MAX_ERRMSG];
+            strncpy(fork_name, val, len);
+            fork_name[len] = '\0';
+            sprintf(result.message, "Forked to %s", fork_name);
+        } else {
+            sprintf(result.message,
+                "Forked %s/%s (creation in progress)",
+                r->owner, r->repo);
+        }
+    } else if (http_status == 403) {
+        result.code = GIT_ERR_AUTH;
+        sprintf(result.message,
+            "Permission denied: cannot fork %s/%s",
+            r->owner, r->repo);
+    } else if (http_status == 404) {
+        result.code = GIT_ERR_NOTFOUND;
+        sprintf(result.message,
+            "Repository %s/%s not found", r->owner, r->repo);
+    } else {
+        result.code = GIT_ERR_NETWORK;
+        sprintf(result.message,
+            "Fork failed (HTTP %d)", http_status);
+    }
+
+    free(response);
+    return result;
+}
+
+/* --- File delete operations --- */
+
+/*
+ * Delete a file from the repo via DELETE /repos/:o/:r/contents/:path.
+ * Requires the file's blob SHA. Also removes from local disk and state.
+ */
+GitResult git_rm(r, path, fl)
+GitRepo *r;
+char *path;
+GitFileList *fl;
+{
+    GitResult result;
+    char *response;
+    char api_path[1024];
+    char post_body[GIT_MAX_PATH + GIT_MAX_SHA + GIT_MAX_BRANCH + 128];
+    int http_status;
+    int i, found;
+    char file_sha[GIT_MAX_SHA];
+    char *val;
+    int len;
+
+    result.code = GIT_OK;
+    result.message[0] = '\0';
+    result.files_affected = 0;
+
+    if (!path || !path[0]) {
+        result.code = GIT_ERR_PARAM;
+        sprintf(result.message, "File path required");
+        return result;
+    }
+
+    /* Find file in state to get its SHA */
+    found = -1;
+    for (i = 0; i < fl->count; i++) {
+        if (strcmp(fl->files[i].path, path) == 0) {
+            found = i;
+            break;
+        }
+    }
+
+    if (found < 0) {
+        result.code = GIT_ERR_NOTFOUND;
+        sprintf(result.message, "File '%s' not tracked", path);
+        return result;
+    }
+
+    /* We need the git blob SHA, not our content hash.
+     * Fetch it from the Contents API. */
+    response = (char *)malloc(GIT_RESPONSE_BUF);
+    if (!response) {
+        result.code = GIT_ERR_MEMORY;
+        sprintf(result.message, "Out of memory");
+        return result;
+    }
+
+    sprintf(api_path, "/repos/%s/%s/contents/%s?ref=%s",
+            r->owner, r->repo, path, r->branch);
+    http_status = gh_api_request(r->token, "GET", api_path, NULL,
+                                 response, GIT_RESPONSE_BUF);
+
+    if (http_status < 200 || http_status >= 300) {
+        free(response);
+        result.code = GIT_ERR_NOTFOUND;
+        sprintf(result.message,
+            "File '%s' not found on remote (HTTP %d)",
+            path, http_status);
+        return result;
+    }
+
+    val = json_find_string(response, "sha", &len);
+    if (!val || len < 1 || len >= GIT_MAX_SHA) {
+        free(response);
+        result.code = GIT_ERR_NETWORK;
+        sprintf(result.message, "Could not get file SHA");
+        return result;
+    }
+    strncpy(file_sha, val, len);
+    file_sha[len] = '\0';
+
+    /* DELETE the file */
+    {
+        char escaped_path[GIT_MAX_PATH];
+        char escaped_msg[256];
+        json_escape(path, escaped_path, GIT_MAX_PATH);
+        sprintf(escaped_msg, "Delete %s", path);
+
+        sprintf(post_body,
+            "{\"message\":\"%s\",\"sha\":\"%s\",\"branch\":\"%s\"}",
+            escaped_msg, file_sha, r->branch);
+    }
+
+    sprintf(api_path, "/repos/%s/%s/contents/%s",
+            r->owner, r->repo, path);
+    http_status = gh_api_request(r->token, "DELETE", api_path,
+                                 post_body, response, GIT_RESPONSE_BUF);
+
+    free(response);
+
+    if (http_status == 200) {
+        /* Remove local file */
+        {
+            char filepath[GIT_MAX_PATH];
+            sprintf(filepath, "%s/%s", r->local_path, path);
+            unlink(filepath);
+        }
+
+        /* Remove from file list */
+        for (i = found; i < fl->count - 1; i++) {
+            fl->files[i] = fl->files[i + 1];
+        }
+        fl->count--;
+
+        /* Save updated state */
+        git_save_state(r, fl);
+
+        result.files_affected = 1;
+        sprintf(result.message, "Deleted '%s'", path);
+    } else if (http_status == 404) {
+        result.code = GIT_ERR_NOTFOUND;
+        sprintf(result.message, "File '%s' not found on remote", path);
+    } else if (http_status == 409) {
+        result.code = GIT_ERR_CONFLICT;
+        sprintf(result.message,
+            "Conflict deleting '%s' (SHA mismatch)", path);
+    } else {
+        result.code = GIT_ERR_NETWORK;
+        sprintf(result.message,
+            "Failed to delete file (HTTP %d)", http_status);
+    }
+
+    return result;
+}
+
+/* --- Gitignore operations --- */
+
+/*
+ * Load .gitignore from repo root and parse patterns.
+ * Supports: literal names, wildcards (*.o), directory patterns (build/),
+ * root-relative (/config), and negation (!important.o).
+ */
+GitResult git_ignore_load(r, out)
+GitRepo *r;
+GitIgnoreList *out;
+{
+    GitResult result;
+    char filepath[GIT_MAX_PATH];
+    char *data;
+    long fsize;
+    char *line, *next;
+
+    result.code = GIT_OK;
+    result.message[0] = '\0';
+    result.files_affected = 0;
+    out->count = 0;
+
+    sprintf(filepath, "%s/.gitignore", r->local_path);
+    data = git_read_file(filepath, &fsize);
+    if (!data) {
+        /* No .gitignore is fine — just means nothing ignored */
+        sprintf(result.message, "No .gitignore found");
+        return result;
+    }
+
+    line = data;
+    while (line && *line && out->count < GIT_MAX_IGNORE_PATTERNS) {
+        int plen;
+        char *pat;
+
+        next = strchr(line, '\n');
+        if (next) {
+            *next = '\0';
+            next++;
+        }
+
+        /* Strip CR */
+        plen = strlen(line);
+        if (plen > 0 && line[plen - 1] == '\r')
+            line[--plen] = '\0';
+
+        /* Skip empty lines and comments */
+        if (plen == 0 || line[0] == '#') {
+            line = next;
+            continue;
+        }
+
+        /* Strip trailing whitespace */
+        while (plen > 0 && (line[plen - 1] == ' ' ||
+               line[plen - 1] == '\t'))
+            line[--plen] = '\0';
+
+        if (plen == 0) {
+            line = next;
+            continue;
+        }
+
+        pat = line;
+        out->negated[out->count] = 0;
+        out->dir_only[out->count] = 0;
+
+        /* Negation */
+        if (pat[0] == '!') {
+            out->negated[out->count] = 1;
+            pat++;
+            plen--;
+        }
+
+        /* Directory-only pattern (trailing /) */
+        if (plen > 0 && pat[plen - 1] == '/') {
+            out->dir_only[out->count] = 1;
+            pat[plen - 1] = '\0';
+            plen--;
+        }
+
+        if (plen > 0 && plen < GIT_MAX_IGNORE_PATTERN) {
+            strncpy(out->patterns[out->count], pat,
+                    GIT_MAX_IGNORE_PATTERN - 1);
+            out->patterns[out->count][GIT_MAX_IGNORE_PATTERN - 1] = '\0';
+            out->count++;
+        }
+
+        line = next;
+    }
+
+    free(data);
+
+    result.files_affected = out->count;
+    sprintf(result.message, "Loaded %d ignore patterns", out->count);
+    return result;
+}
+
+/*
+ * Check if a path matches any pattern in the ignore list.
+ * Returns 1 if ignored, 0 if not.
+ *
+ * Supports:
+ *   literal    "README.md"     — match exact filename
+ *   wildcard   "*.o"           — match by extension
+ *   directory  "build"         — match directory name in path
+ *   root-rel   "/config.local" — match only at repo root
+ *   negation   "!important.o"  — un-ignore
+ */
+int git_ignore_match(ignore, path)
+GitIgnoreList *ignore;
+char *path;
+{
+    int i;
+    int matched;
+    char *basename;
+    char *last_slash;
+
+    if (!ignore || ignore->count == 0 || !path || !path[0])
+        return 0;
+
+    /* Extract basename */
+    last_slash = strrchr(path, '/');
+    basename = last_slash ? last_slash + 1 : path;
+
+    matched = 0;
+
+    for (i = 0; i < ignore->count; i++) {
+        char *pat;
+        int pat_len;
+        int is_match;
+
+        pat = ignore->patterns[i];
+        pat_len = strlen(pat);
+        is_match = 0;
+
+        if (pat[0] == '/') {
+            /* Root-relative: match against full path from root */
+            char *rel_pat;
+            rel_pat = pat + 1;
+
+            if (strcmp(path, rel_pat) == 0)
+                is_match = 1;
+        } else if (strchr(pat, '/')) {
+            /* Pattern contains slash: match against full path */
+            if (strcmp(path, pat) == 0)
+                is_match = 1;
+        } else if (pat[0] == '*' && pat[1] == '.') {
+            /* Wildcard extension: *.ext */
+            char *ext;
+            char *pat_ext;
+
+            pat_ext = pat + 1;  /* ".ext" */
+            ext = strrchr(basename, '.');
+            if (ext && strcmp(ext, pat_ext) == 0)
+                is_match = 1;
+        } else if (ignore->dir_only[i]) {
+            /* Directory pattern: check if path starts with dir/ */
+            int dlen;
+            dlen = strlen(pat);
+
+            if (strncmp(path, pat, dlen) == 0 &&
+                (path[dlen] == '/' || path[dlen] == '\0'))
+                is_match = 1;
+
+            /* Also check if any component matches */
+            {
+                char search[GIT_MAX_IGNORE_PATTERN + 2];
+                sprintf(search, "/%s/", pat);
+                if (strstr(path, search))
+                    is_match = 1;
+            }
+        } else {
+            /* Literal: match against basename */
+            if (strcmp(basename, pat) == 0)
+                is_match = 1;
+        }
+
+        if (is_match) {
+            if (ignore->negated[i]) {
+                matched = 0;  /* Un-ignore */
+            } else {
+                matched = 1;  /* Ignore */
+            }
+        }
+    }
+
+    return matched;
 }
 
 /* --- Compare operations --- */

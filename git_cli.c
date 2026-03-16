@@ -26,6 +26,13 @@
  *        ./git release create <tag> [-t "title"] [-m "body"]
  *        ./git fork
  *        ./git rm <file>
+ *        ./git repo owner/repo
+ *        ./git repos <username>
+ *        ./git issues
+ *        ./git issue <N>
+ *        ./git issue create "title" "body"
+ *        ./git pulls
+ *        ./git cat <path>
  *
  * (c) 2026 ARNLTony & Claude. MIT License.
  */
@@ -1520,6 +1527,644 @@ char *token;
     return 0;
 }
 
+/* --- Helper: print text wrapped at width --- */
+
+static void print_wrapped(prefix, text, width)
+char *prefix;
+char *text;
+int width;
+{
+    int col, plen;
+    char *p;
+
+    plen = strlen(prefix);
+    col = 0;
+
+    printf("%s", prefix);
+    col = plen;
+
+    p = text;
+    while (*p) {
+        if (*p == '\n') {
+            printf("\n%s", prefix);
+            col = plen;
+            p++;
+            continue;
+        }
+
+        if (col >= width && *p == ' ') {
+            printf("\n%s", prefix);
+            col = plen;
+            p++;
+            continue;
+        }
+
+        putchar(*p);
+        col++;
+        p++;
+    }
+    printf("\n");
+}
+
+/* --- Helper: print a JSON field with label --- */
+
+static void print_field(json, key, label)
+char *json;
+char *key;
+char *label;
+{
+    char *val;
+    int len;
+    char buf[512];
+
+    val = json_find_string(json, key, &len);
+    if (val && len > 0) {
+        if (len > (int)sizeof(buf) - 1) len = sizeof(buf) - 1;
+        json_unescape(val, len, buf, sizeof(buf));
+        printf("  %s: %s\n", label, buf);
+    }
+}
+
+/* --- Subcommand: repo --- */
+
+static int cmd_repo_info(argc, argv, token)
+int argc;
+char **argv;
+char *token;
+{
+    char *response;
+    char api_path[1024];
+    int http_status;
+    char owner[GIT_MAX_OWNER];
+    char reponame[GIT_MAX_REPO];
+    char *slash;
+    int owner_len;
+    long num;
+
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s repo owner/repo\n", PROG_NAME);
+        return 1;
+    }
+
+    slash = strchr(argv[1], '/');
+    if (!slash) {
+        fprintf(stderr, "fatal: '%s' not in owner/repo format\n", argv[1]);
+        return 1;
+    }
+
+    owner_len = slash - argv[1];
+    strncpy(owner, argv[1], owner_len);
+    owner[owner_len] = '\0';
+    strncpy(reponame, slash + 1, GIT_MAX_REPO - 1);
+    reponame[GIT_MAX_REPO - 1] = '\0';
+
+    response = (char *)malloc(GIT_RESPONSE_BUF);
+    if (!response) {
+        fprintf(stderr, "fatal: out of memory\n");
+        return 1;
+    }
+
+    safe_snprintf(api_path, sizeof(api_path), "/repos/%s/%s", owner, reponame);
+    http_status = gh_api_request(token, "GET", api_path, NULL,
+                                 response, GIT_RESPONSE_BUF);
+
+    if (http_status < 200 || http_status >= 300) {
+        fprintf(stderr, "error: failed to get repo info (HTTP %d)\n",
+                http_status);
+        free(response);
+        return 1;
+    }
+
+    printf("\n");
+    print_field(response, "full_name", "Repo");
+    print_field(response, "description", "Desc");
+    print_field(response, "language", "Lang");
+    print_field(response, "default_branch", "Branch");
+
+    num = json_find_number(response, "stargazers_count");
+    if (num >= 0) printf("  Stars: %ld\n", num);
+
+    num = json_find_number(response, "forks_count");
+    if (num >= 0) printf("  Forks: %ld\n", num);
+
+    num = json_find_number(response, "open_issues_count");
+    if (num >= 0) printf("  Issues: %ld\n", num);
+
+    if (json_find_bool(response, "fork") == 1)
+        printf("  (fork)\n");
+    if (json_find_bool(response, "private") == 1)
+        printf("  (private)\n");
+
+    printf("\n");
+    free(response);
+    return 0;
+}
+
+/* --- Subcommand: repos --- */
+
+static int cmd_repos(argc, argv, token)
+int argc;
+char **argv;
+char *token;
+{
+    char *response;
+    char api_path[1024];
+    int http_status;
+    char *elem, *end;
+    char *val;
+    int len, count;
+    char name[256], desc[512];
+    long stars;
+
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s repos <username>\n", PROG_NAME);
+        return 1;
+    }
+
+    response = (char *)malloc(GIT_RESPONSE_BUF);
+    if (!response) {
+        fprintf(stderr, "fatal: out of memory\n");
+        return 1;
+    }
+
+    safe_snprintf(api_path, sizeof(api_path),
+        "/users/%s/repos?sort=updated&per_page=30", argv[1]);
+    http_status = gh_api_request(token, "GET", api_path, NULL,
+                                 response, GIT_RESPONSE_BUF);
+
+    if (http_status < 200 || http_status >= 300) {
+        fprintf(stderr, "error: failed to list repos (HTTP %d)\n",
+                http_status);
+        free(response);
+        return 1;
+    }
+
+    count = 0;
+    elem = json_array_first(response, &end);
+    while (elem) {
+        count++;
+        val = json_find_string(elem, "full_name", &len);
+        if (val && len > 0 && len < (int)sizeof(name) - 1) {
+            json_unescape(val, len, name, sizeof(name));
+        } else {
+            strcpy(name, "???");
+        }
+
+        stars = json_find_number(elem, "stargazers_count");
+
+        val = json_find_string(elem, "description", &len);
+        if (val && len > 0) {
+            if (len > (int)sizeof(desc) - 1) len = sizeof(desc) - 1;
+            json_unescape(val, len, desc, sizeof(desc));
+        } else {
+            desc[0] = '\0';
+        }
+
+        printf("  %s", name);
+        if (stars > 0) printf(" (*%ld)", stars);
+        printf("\n");
+        if (desc[0]) {
+            print_wrapped("    ", desc, 72);
+        }
+
+        elem = json_array_next(elem, &end);
+    }
+
+    if (count == 0) {
+        printf("No repos found.\n");
+    }
+
+    free(response);
+    return 0;
+}
+
+/* --- Subcommand: issues --- */
+
+static int cmd_issues(argc, argv, token)
+int argc;
+char **argv;
+char *token;
+{
+    GitRepo repo;
+    GitFileList *fl;
+    char *response;
+    char api_path[1024];
+    int http_status;
+    char *elem, *end;
+    char *val;
+    int len, count;
+    char title[512];
+    long num;
+
+    fl = (GitFileList *)malloc(sizeof(GitFileList));
+    if (!fl) {
+        fprintf(stderr, "fatal: out of memory\n");
+        return 1;
+    }
+
+    memset(&repo, 0, sizeof(repo));
+    memset(fl, 0, sizeof(GitFileList));
+
+    if (find_repo(&repo, fl, token) < 0) {
+        free(fl);
+        return 1;
+    }
+
+    response = (char *)malloc(GIT_RESPONSE_BUF);
+    if (!response) {
+        fprintf(stderr, "fatal: out of memory\n");
+        free(fl);
+        return 1;
+    }
+
+    safe_snprintf(api_path, sizeof(api_path),
+        "/repos/%s/%s/issues?state=open&per_page=30",
+        repo.owner, repo.repo);
+    http_status = gh_api_request(token, "GET", api_path, NULL,
+                                 response, GIT_RESPONSE_BUF);
+
+    if (http_status < 200 || http_status >= 300) {
+        fprintf(stderr, "error: failed to list issues (HTTP %d)\n",
+                http_status);
+        free(response);
+        free(fl);
+        return 1;
+    }
+
+    count = 0;
+    elem = json_array_first(response, &end);
+    while (elem) {
+        count++;
+        num = json_find_number(elem, "number");
+
+        val = json_find_string(elem, "title", &len);
+        if (val && len > 0 && len < (int)sizeof(title) - 1) {
+            json_unescape(val, len, title, sizeof(title));
+        } else {
+            strcpy(title, "???");
+        }
+
+        printf("  #%ld  %s\n", num, title);
+
+        elem = json_array_next(elem, &end);
+    }
+
+    if (count == 0)
+        printf("No open issues.\n");
+
+    free(response);
+    free(fl);
+    return 0;
+}
+
+/* --- Subcommand: issue --- */
+
+static int cmd_issue(argc, argv, token)
+int argc;
+char **argv;
+char *token;
+{
+    GitRepo repo;
+    GitFileList *fl;
+    char *response;
+    char api_path[1024];
+    int http_status;
+    int issue_num;
+    char *val;
+    int len;
+    char body_buf[4096];
+
+    if (argc < 2) {
+        fprintf(stderr,
+            "usage: %s issue <number>\n"
+            "   or: %s issue create \"title\" \"body\"\n",
+            PROG_NAME, PROG_NAME);
+        return 1;
+    }
+
+    /* Handle "issue create" subcommand */
+    if (strcmp(argv[1], "create") == 0) {
+        char *post_body;
+        char esc_title[1024];
+        char esc_body[4096];
+        long num;
+
+        if (argc < 3) {
+            fprintf(stderr,
+                "usage: %s issue create \"title\" [\"body\"]\n",
+                PROG_NAME);
+            return 1;
+        }
+
+        fl = (GitFileList *)malloc(sizeof(GitFileList));
+        if (!fl) {
+            fprintf(stderr, "fatal: out of memory\n");
+            return 1;
+        }
+        memset(&repo, 0, sizeof(repo));
+        memset(fl, 0, sizeof(GitFileList));
+
+        if (find_repo(&repo, fl, token) < 0) {
+            free(fl);
+            return 1;
+        }
+
+        json_escape(argv[2], esc_title, sizeof(esc_title));
+        if (argc >= 4) {
+            json_escape(argv[3], esc_body, sizeof(esc_body));
+        } else {
+            esc_body[0] = '\0';
+        }
+
+        post_body = (char *)malloc(
+            strlen(esc_title) + strlen(esc_body) + 128);
+        if (!post_body) {
+            fprintf(stderr, "fatal: out of memory\n");
+            free(fl);
+            return 1;
+        }
+
+        sprintf(post_body, "{\"title\":\"%s\",\"body\":\"%s\"}",
+                esc_title, esc_body);
+
+        response = (char *)malloc(GIT_RESPONSE_BUF);
+        if (!response) {
+            free(post_body);
+            free(fl);
+            fprintf(stderr, "fatal: out of memory\n");
+            return 1;
+        }
+
+        safe_snprintf(api_path, sizeof(api_path),
+            "/repos/%s/%s/issues", repo.owner, repo.repo);
+        http_status = gh_api_request(token, "POST", api_path,
+                                     post_body, response,
+                                     GIT_RESPONSE_BUF);
+
+        if (http_status == 201) {
+            num = json_find_number(response, "number");
+            if (num > 0) {
+                printf("Created issue #%ld\n", num);
+            } else {
+                printf("Issue created.\n");
+            }
+        } else {
+            fprintf(stderr, "error: failed to create issue (HTTP %d)\n",
+                    http_status);
+        }
+
+        free(post_body);
+        free(response);
+        free(fl);
+        return (http_status == 201) ? 0 : 1;
+    }
+
+    /* View issue detail */
+    issue_num = atoi(argv[1]);
+    if (issue_num <= 0) {
+        fprintf(stderr, "error: invalid issue number '%s'\n", argv[1]);
+        return 1;
+    }
+
+    fl = (GitFileList *)malloc(sizeof(GitFileList));
+    if (!fl) {
+        fprintf(stderr, "fatal: out of memory\n");
+        return 1;
+    }
+    memset(&repo, 0, sizeof(repo));
+    memset(fl, 0, sizeof(GitFileList));
+
+    if (find_repo(&repo, fl, token) < 0) {
+        free(fl);
+        return 1;
+    }
+
+    response = (char *)malloc(GIT_RESPONSE_BUF);
+    if (!response) {
+        fprintf(stderr, "fatal: out of memory\n");
+        free(fl);
+        return 1;
+    }
+
+    safe_snprintf(api_path, sizeof(api_path),
+        "/repos/%s/%s/issues/%d", repo.owner, repo.repo, issue_num);
+    http_status = gh_api_request(token, "GET", api_path, NULL,
+                                 response, GIT_RESPONSE_BUF);
+
+    if (http_status < 200 || http_status >= 300) {
+        fprintf(stderr, "error: issue not found (HTTP %d)\n", http_status);
+        free(response);
+        free(fl);
+        return 1;
+    }
+
+    printf("\n");
+    printf("  Issue #%ld\n", json_find_number(response, "number"));
+    print_field(response, "title", "Title");
+    print_field(response, "state", "State");
+
+    /* Author from nested user object */
+    {
+        char *user_obj;
+        user_obj = strstr(response, "\"user\"");
+        if (user_obj) {
+            val = json_find_string(user_obj, "login", &len);
+            if (val && len > 0) {
+                char login[128];
+                if (len > (int)sizeof(login) - 1) len = sizeof(login) - 1;
+                json_unescape(val, len, login, sizeof(login));
+                printf("  Author: %s\n", login);
+            }
+        }
+    }
+
+    print_field(response, "created_at", "Created");
+    printf("\n");
+
+    val = json_find_string(response, "body", &len);
+    if (val && len > 0) {
+        if (len > (int)sizeof(body_buf) - 1) len = sizeof(body_buf) - 1;
+        json_unescape(val, len, body_buf, sizeof(body_buf));
+        print_wrapped("  ", body_buf, 72);
+    } else {
+        printf("  (no description)\n");
+    }
+    printf("\n");
+
+    free(response);
+    free(fl);
+    return 0;
+}
+
+/* --- Subcommand: pulls --- */
+
+static int cmd_pulls(argc, argv, token)
+int argc;
+char **argv;
+char *token;
+{
+    GitRepo repo;
+    GitFileList *fl;
+    char *response;
+    char api_path[1024];
+    int http_status;
+    char *elem, *end;
+    char *val;
+    int len, count;
+    char title[512];
+    long num;
+
+    fl = (GitFileList *)malloc(sizeof(GitFileList));
+    if (!fl) {
+        fprintf(stderr, "fatal: out of memory\n");
+        return 1;
+    }
+
+    memset(&repo, 0, sizeof(repo));
+    memset(fl, 0, sizeof(GitFileList));
+
+    if (find_repo(&repo, fl, token) < 0) {
+        free(fl);
+        return 1;
+    }
+
+    response = (char *)malloc(GIT_RESPONSE_BUF);
+    if (!response) {
+        fprintf(stderr, "fatal: out of memory\n");
+        free(fl);
+        return 1;
+    }
+
+    safe_snprintf(api_path, sizeof(api_path),
+        "/repos/%s/%s/pulls?state=open&per_page=30",
+        repo.owner, repo.repo);
+    http_status = gh_api_request(token, "GET", api_path, NULL,
+                                 response, GIT_RESPONSE_BUF);
+
+    if (http_status < 200 || http_status >= 300) {
+        fprintf(stderr, "error: failed to list PRs (HTTP %d)\n",
+                http_status);
+        free(response);
+        free(fl);
+        return 1;
+    }
+
+    count = 0;
+    elem = json_array_first(response, &end);
+    while (elem) {
+        count++;
+        num = json_find_number(elem, "number");
+
+        val = json_find_string(elem, "title", &len);
+        if (val && len > 0 && len < (int)sizeof(title) - 1) {
+            json_unescape(val, len, title, sizeof(title));
+        } else {
+            strcpy(title, "???");
+        }
+
+        printf("  #%ld  %s\n", num, title);
+
+        elem = json_array_next(elem, &end);
+    }
+
+    if (count == 0)
+        printf("No open pull requests.\n");
+
+    free(response);
+    free(fl);
+    return 0;
+}
+
+/* --- Subcommand: cat --- */
+
+static int cmd_cat(argc, argv, token)
+int argc;
+char **argv;
+char *token;
+{
+    GitRepo repo;
+    GitFileList *fl;
+    char *response;
+    char api_path[1024];
+    int http_status;
+    char *val;
+    int len;
+    char *decoded;
+    int decoded_len;
+
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s cat <path>\n", PROG_NAME);
+        return 1;
+    }
+
+    fl = (GitFileList *)malloc(sizeof(GitFileList));
+    if (!fl) {
+        fprintf(stderr, "fatal: out of memory\n");
+        return 1;
+    }
+
+    memset(&repo, 0, sizeof(repo));
+    memset(fl, 0, sizeof(GitFileList));
+
+    if (find_repo(&repo, fl, token) < 0) {
+        free(fl);
+        return 1;
+    }
+
+    response = (char *)malloc(GIT_RESPONSE_BUF);
+    if (!response) {
+        fprintf(stderr, "fatal: out of memory\n");
+        free(fl);
+        return 1;
+    }
+
+    safe_snprintf(api_path, sizeof(api_path),
+        "/repos/%s/%s/contents/%s?ref=%s",
+        repo.owner, repo.repo, argv[1], repo.branch);
+    http_status = gh_api_request(token, "GET", api_path, NULL,
+                                 response, GIT_RESPONSE_BUF);
+
+    if (http_status < 200 || http_status >= 300) {
+        fprintf(stderr, "error: file not found (HTTP %d)\n", http_status);
+        free(response);
+        free(fl);
+        return 1;
+    }
+
+    val = json_find_string(response, "encoding", &len);
+    if (!val || strncmp(val, "base64", 6) != 0) {
+        fprintf(stderr, "error: file too large or unsupported encoding\n");
+        free(response);
+        free(fl);
+        return 1;
+    }
+
+    val = json_find_string(response, "content", &len);
+    if (!val || len == 0) {
+        fprintf(stderr, "error: no content found\n");
+        free(response);
+        free(fl);
+        return 1;
+    }
+
+    decoded = (char *)malloc(len);
+    if (!decoded) {
+        fprintf(stderr, "fatal: out of memory\n");
+        free(response);
+        free(fl);
+        return 1;
+    }
+
+    decoded_len = gh_base64_decode(val, len, decoded, len);
+    decoded[decoded_len] = '\0';
+    printf("%s", decoded);
+
+    free(decoded);
+    free(response);
+    free(fl);
+    return 0;
+}
+
 /* --- Help --- */
 
 static void cmd_help()
@@ -1550,6 +2195,15 @@ static void cmd_help()
     printf("    release create <tag> [-t -m]       Create release\n");
     printf("    fork                               Fork repository\n");
     printf("    rm <file>                          Delete file\n");
+    printf("\n");
+    printf("  GitHub commands:\n");
+    printf("    repo owner/repo                    Show repo info\n");
+    printf("    repos <username>                   List user's repos\n");
+    printf("    issues                             List open issues\n");
+    printf("    issue <N>                          View issue detail\n");
+    printf("    issue create \"title\" \"body\"         Create issue\n");
+    printf("    pulls                              List pull requests\n");
+    printf("    cat <path>                         View file contents\n");
     printf("    help                               Show this help\n");
     printf("\n");
     printf("  Token: place your GitHub token in .github_token\n");
@@ -1642,6 +2296,24 @@ char **argv;
     }
     else if (strcmp(subcmd, "rm") == 0) {
         return cmd_rm(sub_argc, sub_argv, token);
+    }
+    else if (strcmp(subcmd, "repo") == 0) {
+        return cmd_repo_info(sub_argc, sub_argv, token);
+    }
+    else if (strcmp(subcmd, "repos") == 0) {
+        return cmd_repos(sub_argc, sub_argv, token);
+    }
+    else if (strcmp(subcmd, "issues") == 0) {
+        return cmd_issues(sub_argc, sub_argv, token);
+    }
+    else if (strcmp(subcmd, "issue") == 0) {
+        return cmd_issue(sub_argc, sub_argv, token);
+    }
+    else if (strcmp(subcmd, "pulls") == 0) {
+        return cmd_pulls(sub_argc, sub_argv, token);
+    }
+    else if (strcmp(subcmd, "cat") == 0) {
+        return cmd_cat(sub_argc, sub_argv, token);
     }
     else {
         fprintf(stderr, "'%s' is not a git command. See '%s help'.\n",
